@@ -15,7 +15,11 @@ def run_reply_loop(poll_interval=30):
             if unread_emails:
                 print(f"[INFO] Found {len(unread_emails)} unread email(s)")
             for email_data in unread_emails:
-                process_user_reply(from_email=email_data["from"], body=email_data["body"])
+                process_user_reply(
+                    from_email=email_data["from"],
+                    body=email_data["body"],
+                    attachments=email_data.get("attachments", [])
+                )
         except Exception as e:
             print(f"[ERROR] Exception in reply loop: {e}")
         

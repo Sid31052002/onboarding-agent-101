@@ -35,19 +35,29 @@ def get_unread_emails() -> List[Dict]:
                 from_email = email.utils.parseaddr(msg.get("From"))[1]
 
                 body = ""
+                attachments = []
                 if msg.is_multipart():
                     for part in msg.walk():
                         content_type = part.get_content_type()
-                        if content_type == "text/plain":
+                        content_disposition = str(part.get("Content-Disposition"))
+                        if content_type == "text/plain" and "attachment" not in content_disposition:
                             body = part.get_payload(decode=True).decode()
-                            break
+                        elif "attachment" in content_disposition:
+                            filename = part.get_filename()
+                            if filename:
+                                filedata = part.get_payload(decode=True)
+                                attachments.append({
+                                    "filename": filename,
+                                    "data": filedata
+                                })
                 else:
                     body = msg.get_payload(decode=True).decode()
 
                 emails.append({
                     "from": from_email,
                     "subject": subject,
-                    "body": body.strip()
+                    "body": body.strip(),
+                    "attachments": attachments
                 })
 
     mail.logout()

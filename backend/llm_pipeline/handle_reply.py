@@ -5,9 +5,11 @@ from llm_runner.prompt_templates import build_onboarding_prompt
 from llm_runner.run_model import call_local_llm
 from app.services.supabase_client import supabase
 from app.services.email_sender import send_email
+from app.services.ocr_service import extract_text_from_user_documents
 
 from datetime import datetime
 import os
+import time
 
 def process_user_reply(from_email: str, body: str, attachments: list = None):
     # ✅ Step 1: Get the user
@@ -30,6 +32,20 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
             print(f"[DEBUG] Saving attachment: {filepath} (size: {len(filedata)} bytes)")
             with open(filepath, "wb") as f:
                 f.write(filedata)
+
+        # ✅ Wait for 1.5 minutes before running OCR
+        print("[INFO] Waiting 1.5 minutes before running OCR...")
+        time.sleep(90)
+
+        try:
+            ocr_output = extract_text_from_user_documents(from_email)
+            print(f"[INFO] OCR completed. Output saved to: {ocr_output}")
+
+            # ✅ Set onboarding_step to verification_complete
+            supabase.table("users").update({"onboarding_step": "verification_complete"}).eq("email", from_email).execute()
+            print(f"[INFO] Onboarding step set to verification_complete for {from_email}")
+        except Exception as e:
+            print(f"[ERROR] OCR or onboarding_step update failed for {from_email}: {e}")
 
     # Check for required attachments
     required_files = {"commercial.png", "commercial.jpg", "eid.png", "eid.jpg"}
@@ -70,8 +86,11 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
     convo_history = convo_response.data if convo_response.data else []
     convo_context = "\n".join([f"{msg['role']}: {msg['message']}" for msg in convo_history])
 
+    # ✅ Add onboarding_step to context
+    onboarding_step = user.get("onboarding_step", "welcome")
+    full_context = f"Onboarding Step: {onboarding_step}\n\n{convo_context}\n\nFAQ:\n{faq_context}"
+
     # ✅ Step 4: Build prompt and call LLM with both contexts
-    full_context = f"{convo_context}\n\nFAQ:\n{faq_context}"
     prompt = build_onboarding_prompt(user_message=body, context=full_context)
 
     llm_response = call_local_llm(prompt)

@@ -8,7 +8,11 @@ def build_onboarding_prompt(user_message: str, context: str = "") -> str:
 
     if onboarding_step == "welcome":
         instructions = (
-            "Greet the user, help with their queries, and ask them to choose the type of account they want to open."
+            "Ask the user these questions one by one, waiting for their answer before moving to the next:\n"
+            "1) What kind of account would you like to open—Savings or Commercial?\n"
+            "2) Do you confirm that you are over 18 years of age? If yes, proceed. Otherwise, inform them they are not eligible.\n"
+            "3) What is your gross yearly salary? (Just remember the salary.)\n"
+            "4) Please submit the following documents as image files: Emirates ID (EID) and Commercial License."
         )
     elif onboarding_step == "document_verification":
         instructions = (

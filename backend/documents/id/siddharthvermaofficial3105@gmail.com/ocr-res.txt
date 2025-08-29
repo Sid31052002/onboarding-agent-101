@@ -1,3 +1,36 @@
---- [TYPE: UNKNOWN] Field Service Report.png ---
-[ERROR extracting text: HTTP 429 - {"error":{"message":"Provider returned error","code":429,"metadata":{"raw":"meta-llama/llama-3.2-11b-vision-instruct:free is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations","provider_name":"Together"}},"user_id":"user_31DZhRMiJ3gHb4xxX3KBmJhPwcC"}]
+--- [TYPE: COMMERCIAL] Docuemt-1.png ---
+**Document Type Identification:**
+
+* The document is classified as a "Commercial Registration Document".
+
+**Extracted Text:**
+
+**Title Section:**
+
+* **Header:** Commercial License
+* **License No.:** 1455403
+* **License Details:** 
+	+ Company Name: THRIVV GROWTH TECHNOLOGY SERVICES L.L.C
+	+ Business Name: THRIVV GROWTH TECHNOLOGY SERVICES L.L.C
+	+ License Category: Dep. of Economic Development
+	+ Legal Type: Limited Liability Company - Single Owner(LLC - SO)
+	+ Expiry Date: 08/01/2026
+	+ D&B D-U-N-S No. Considering the D&B D-U-N-S listing, this is likely the registered ID used for business identification.
+	+ Register No.: 2498226
+* **Issue Date:** 09/01/2025
+* **DCCI No.:** 587419
+* **License Members:**
+	+ Name: 
+	+ No./رقم التسجيلownership/الهيئة: 1745954
+	+ Role/العضوية/: shares owner/مالك
+	+ Nationality/الجنسية: India/الهند
+	+ VARSHA BALAJI BALAJI
+	+ FARSHA BALAJI BALAJI
+
+**Wording and Notes:**
+
+* The document is written in both English and Arabic, indicating its official status in Dubai.
+* The presence of Arabic and English text suggests that the document is intended for use in both languages.
+* The document includes a QR code, which may be used for quick access to electronic versions of the license or other business information.
+* The document is issued by the Government of Dubai, Department of Economic Development,, indicating its official purpose.
 

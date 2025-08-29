@@ -3,6 +3,7 @@
 import os
 import base64
 import requests
+import json
 from dotenv import load_dotenv
 from app.services.supabase_client import supabase
 
@@ -48,25 +49,33 @@ def identify_document_type(extracted_text: str) -> str:
 
 def extract_text_from_user_documents(user_email: str) -> dict:
     """
-    Perform OCR using LLaMA 3.2 Vision on all image documents for a user.
+    Perform OCR using LLaMA 3.2 Vision on all new image documents for a user.
     Returns a dict with format: {'filename': {'type': 'commercial'/'eid'/'unknown', 'text': 'extracted_text'}}
-    Also saves the extracted results to 'ocr-res.txt' under the same folder.
+    Also saves the extracted results to 'ocr-res.txt' and 'ocr-results.json' under the same folder.
     """
     user_folder = os.path.join(DOCUMENTS_ROOT, user_email)
     if not os.path.exists(user_folder):
         raise FileNotFoundError(f"[ERROR] No folder found for user: {user_folder}")
 
+    # Load previous OCR results if exist
+    ocr_json_path = os.path.join(user_folder, "ocr-results.json")
+    if os.path.exists(ocr_json_path):
+        with open(ocr_json_path, "r", encoding="utf-8") as f:
+            ocr_results = json.load(f)
+    else:
+        ocr_results = {}
+
     # Get all image files in the folder
     image_files = [f for f in os.listdir(user_folder) 
                    if f.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))]
-    
-    if not image_files:
-        raise Exception("[ERROR] No image files found for OCR processing.")
 
-    ocr_results = {}
     result_text_for_file = ""
 
     for filename in image_files:
+        if filename in ocr_results:
+            # Already processed, skip
+            continue
+
         file_path = os.path.join(user_folder, filename)
         print(f"[INFO] Processing file: {filename}")
 
@@ -153,6 +162,10 @@ Return the text in a clean, structured format."""
     output_file = os.path.join(user_folder, "ocr-res.txt")
     with open(output_file, "w", encoding="utf-8") as f:
         f.write(result_text_for_file)
+
+    # Save OCR results as JSON for future runs
+    with open(ocr_json_path, "w", encoding="utf-8") as f:
+        json.dump(ocr_results, f, ensure_ascii=False, indent=2)
 
     print(f"[INFO] OCR results saved to: {output_file}")
 

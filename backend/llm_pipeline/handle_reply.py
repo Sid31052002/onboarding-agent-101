@@ -109,10 +109,14 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                 if wrong_docs:
                     body += "\nThe following document(s) you submitted are not required or could not be recognized:\n"
                     for filename, doc_type in wrong_docs:
+                        doc_info = ocr_results.get(filename, {})
+                        status_message = doc_info.get("status_message", "")
+                        raw_text = doc_info.get("raw_text", "")
                         body += (
-                            f"• {filename}: "
-                            f"You have submitted this document (detected type: {doc_type}). "
-                            "This document is not required. Please submit only your Commercial Registration Document and Resident Identity Card (EID).\n"
+                            f"• {filename}: {status_message}\n"
+                            "Extracted text from your document:\n"
+                            f"{raw_text}\n"
+                            "Please submit only your Commercial Registration Document and Resident Identity Card (EID) containing the required fields.\n"
                         )
                 body += "\nPlease reply to this email with the correct document(s) attached as image files."
 

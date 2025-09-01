@@ -54,11 +54,39 @@ with tabs[0]:
         phone_number = st.text_input("Phone Number")
         email = st.text_input("Email")
         business_name = st.text_input("Business Name")
+
+        # Q1: Account type
+        account_type = st.radio(
+            "What kind of account do you want to open?",
+            ["Savings", "Corporate"]
+        )
+
+        # Q2: Ownership type
+        ownership_type = st.radio(
+            "Do you want to open a single owner or partnership account?",
+            ["Single Owner", "Partnership"]
+        )
+
+        # Q3: Partnership details (always visible)
+        partnership_details = st.radio(
+            "Are all shareholders in your business individual persons or not?",
+            [
+                "All shareholders are individual persons",
+                "One or more shareholders are companies or other legal entities"
+            ]
+        )
+
+        # Q4: Expected annual turnover
+        annual_turnover = st.text_input("What is your expected annual turnover?")
+
+        # Q5: Age confirmation
+        is_above_18 = st.checkbox("Do you confirm you are above 18 years of age?")
+
         submitted = st.form_submit_button("Register")
 
         if submitted:
-            if not all([name, phone_number, email, business_name]):
-                st.warning("⚠️ Please fill all required fields.")
+            if not all([name, phone_number, email, business_name, account_type, ownership_type, annual_turnover]) or (ownership_type == "Partnership" and not partnership_details) or not is_above_18:
+                st.warning("⚠️ Please fill all required fields and confirm age.")
             else:
                 data = {
                     "name": name,
@@ -66,6 +94,11 @@ with tabs[0]:
                     "phone_number": phone_number,
                     "email": email,
                     "business_name": business_name,
+                    "account_type": account_type,
+                    "ownership_type": ownership_type,
+                    "partnership_details": partnership_details if ownership_type == "Partnership" else None,
+                    "annual_turnover": annual_turnover,
+                    "is_above_18": is_above_18,
                 }
                 try:
                     response = requests.post(FASTAPI_URL, json=data)

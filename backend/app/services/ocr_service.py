@@ -12,10 +12,12 @@ load_dotenv()
 
 DOCUMENTS_ROOT = os.path.join("backend", "documents", "id")
 
-# === LLaMA 3.2 Vision CONFIG ===
-LLAMA_API_KEY = os.getenv("OPENROUTER_API_KEY")
-LLAMA_API_URL = "https://openrouter.ai/api/v1/chat/completions"
-LLAMA_MODEL_NAME = "meta-llama/llama-3.2-11b-vision-instruct"
+# === OCR MODEL CONFIG (OpenRouter) ===
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+# Default: Qwen2.5-VL (7B). Can be swapped for 32B / 72B
+OCR_MODEL_NAME = "qwen/qwen-2.5-vl-7b-instruct"
 
 # ---------------------------
 # Keywords and Field Mapping
@@ -81,20 +83,21 @@ def encode_image(image_path: str) -> str:
 def run_ocr(image_path: str) -> str:
     image_url = encode_image(image_path)
 
-    prompt = """You are an OCR system.Perform OCR on the provided image.
-- Preserve numbers, dates, and names accurately
-- Keep structure as much as possible
-- Return plain extracted text only
+    prompt = """You are an OCR system.
+- Perform OCR on the provided image
+- Output only raw extracted text (no explanations, no formatting)
+- Preserve numbers, names, and dates exactly
+- Keep line breaks as in the image
 """
 
     headers = {
-        "Authorization": f"Bearer {LLAMA_API_KEY}",
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
         "X-Title": "OCR Extraction"
     }
 
     payload = {
-        "model": LLAMA_MODEL_NAME,
+        "model": OCR_MODEL_NAME,
         "messages": [
             {
                 "role": "user",
@@ -108,7 +111,7 @@ def run_ocr(image_path: str) -> str:
         "temperature": 0.1
     }
 
-    response = requests.post(LLAMA_API_URL, headers=headers, json=payload)
+    response = requests.post(OPENROUTER_API_URL, headers=headers, json=payload)
     if response.status_code == 200:
         result = response.json()
         return result["choices"][0]["message"]["content"].strip()

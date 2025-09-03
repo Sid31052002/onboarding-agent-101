@@ -5,20 +5,9 @@ from email.mime.text import MIMEText
 from app.config import SMTP_SERVER, SMTP_PORT, SMTP_USERNAME, SMTP_PASSWORD, FROM_EMAIL
 
 
-def send_welcome_email(to_email: str, user_name: str):
+def send_welcome_email(to_email: str, details: str):
     subject = "Welcome to Thrivv 🎉"
-    body = f"""
-    Hi {user_name},
-
-    Welcome to Thrivv!
-    We are delighted that you registered with us.
-
-    I am your onboarding agent and I will help you get onboarded.
-    Please reply with 'Continue' if you are interested, otherwise reply with 'Exit'.
-
-    Cheers,  
-    Thrivv Onboarding Agent
-    """
+    body = details
 
     send_email(to_email, subject, body)
 

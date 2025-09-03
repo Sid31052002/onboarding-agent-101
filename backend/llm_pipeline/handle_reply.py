@@ -5,11 +5,12 @@ from llm_runner.prompt_templates import build_onboarding_prompt
 from llm_runner.run_model import call_local_llm
 from app.services.supabase_client import supabase
 from app.services.email_sender import send_email
-from app.services.ocr_service import extract_text_from_user_documents
+from app.services.ocr_service import process_document
 
 from datetime import datetime
 import os
 import time
+import json
 
 def check_documents_in_ocr(ocr_results: dict) -> dict:
     """
@@ -54,13 +55,10 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
         save_dir = os.path.join("backend", "documents", "id", from_email)
         os.makedirs(save_dir, exist_ok=True)
         
-        # Filter and save only image files
         image_files_saved = []
         for a in attachments:
             filename = a["filename"]
             filedata = a["data"]
-            
-            # Check if file is an image
             if filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
                 filepath = os.path.join(save_dir, filename)
                 print(f"[DEBUG] Saving image attachment: {filepath} (size: {len(filedata)} bytes)")
@@ -78,12 +76,61 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
             return
         
         supabase.table("users").update({"onboarding_step": "document_verification"}).eq("email", from_email).execute()
-        print("[INFO] Waiting 1.5 minutes before running OCR...")
-        time.sleep(20)
+        print("[INFO] Running OCR for uploaded documents...")
 
+        # Run OCR for each image using process_document
+        for filename in image_files_saved:
+            document_id = os.path.splitext(filename)[0]
+            file_path = os.path.join(save_dir, filename)
+            try:
+                process_document(from_email, document_id, file_path)
+            except Exception as e:
+                print(f"[ERROR] OCR failed for {filename}: {e}")
+
+        # Now extract structured OCR results
         try:
-            # Get OCR results as structured data
-            ocr_results = extract_text_from_user_documents(from_email)
+            # Gather OCR results from output.json files for each image
+            ocr_results = {}
+            for filename in image_files_saved:
+                document_id = os.path.splitext(filename)[0]
+                output_path = os.path.join(save_dir, document_id, "output.json")
+                if os.path.exists(output_path):
+                    with open(output_path, "r", encoding="utf-8") as f:
+                        analysis = json.load(f)
+                    ocr_results[filename] = {
+                        "type": analysis.get("document_type", "unknown"),
+                        "raw_text": analysis.get("raw_text", ""),
+                        "status_message": analysis.get("status_message", ""),
+                        "extracted_fields": analysis.get("extracted_fields", {}),
+                        "validation": analysis.get("validation", {}),
+                        "is_valid": analysis.get("is_valid", False)
+                    }
+                else:
+                    ocr_results[filename] = {
+                        "type": "error",
+                        "raw_text": "",
+                        "status_message": "❌ ERROR: No OCR output found.",
+                        "extracted_fields": {},
+                        "validation": {},
+                        "is_valid": False
+                    }
+            # --- NEW LOGIC: Aggregate previous documents ---
+            user_docs_dir = os.path.join("backend", "documents", "id", from_email)
+            if os.path.exists(user_docs_dir):
+                for doc_dir in os.listdir(user_docs_dir):
+                    output_path = os.path.join(user_docs_dir, doc_dir, "output.json")
+                    if os.path.exists(output_path):
+                        with open(output_path, "r", encoding="utf-8") as f:
+                            analysis = json.load(f)
+                        # Use doc_dir as key to avoid filename collision
+                        ocr_results[doc_dir] = {
+                            "type": analysis.get("document_type", "unknown"),
+                            "raw_text": analysis.get("raw_text", ""),
+                            "status_message": analysis.get("status_message", ""),
+                            "extracted_fields": analysis.get("extracted_fields", {}),
+                            "validation": analysis.get("validation", {}),
+                            "is_valid": analysis.get("is_valid", False)
+                        }
             print(f"[INFO] OCR completed for {len(ocr_results)} documents")
 
             # Check OCR results for required documents

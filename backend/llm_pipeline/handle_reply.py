@@ -84,6 +84,7 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
             file_path = os.path.join(save_dir, filename)
             try:
                 process_document(from_email, document_id, file_path)
+                time.sleep(60)
             except Exception as e:
                 print(f"[ERROR] OCR failed for {filename}: {e}")
 
@@ -143,6 +144,22 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                 if data.get("type") == "unknown"
             ]
             
+            summary_texts = []
+            if wrong_docs:
+                for filename, doc_type in wrong_docs:
+                    doc_info = ocr_results.get(filename, {})
+                    raw_text = doc_info.get("raw_text", "")
+                    if raw_text:
+                        prompt = (
+                            "Summarize the document and tell what it is and give it a title.\n"
+                            "Document text:\n"
+                            f"{raw_text}\n"
+                        )
+                        llm_summary = call_local_llm(prompt)
+                        summary_texts.append(
+                            f"Here is the summary of document '{filename}':\n{llm_summary}\n"
+                        )
+            
             if not doc_status["missing"] and not wrong_docs:
                 subject = "Documents Received and Verified"
                 body = "Great! Both your Commercial Registration Document and Resident Identity Card (EID) have been successfully received and verified. Your onboarding will proceed to the next step."
@@ -158,13 +175,12 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                     for filename, doc_type in wrong_docs:
                         doc_info = ocr_results.get(filename, {})
                         status_message = doc_info.get("status_message", "")
-                        raw_text = doc_info.get("raw_text", "")
                         body += (
                             f"• {filename}: {status_message}\n"
-                            "Extracted text from your document:\n"
-                            f"{raw_text}\n"
-                            "Please submit only your Commercial Registration Document and Resident Identity Card (EID) containing the required fields.\n"
                         )
+                    # Add LLM summaries
+                    body += "\n".join(summary_texts)
+                    body += "\nYou need to submit commercial and eid documents.\n"
                 body += "\nPlease reply to this email with the correct document(s) attached as image files."
 
             send_email(to_email=from_email, subject=subject, body=body)

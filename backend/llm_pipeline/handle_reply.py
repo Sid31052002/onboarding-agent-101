@@ -84,7 +84,7 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
             file_path = os.path.join(save_dir, filename)
             try:
                 process_document(from_email, document_id, file_path)
-                time.sleep(60)
+                time.sleep(120)
             except Exception as e:
                 print(f"[ERROR] OCR failed for {filename}: {e}")
 

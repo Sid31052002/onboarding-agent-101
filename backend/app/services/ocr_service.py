@@ -7,6 +7,8 @@ import json
 import re
 from dotenv import load_dotenv
 from app.services.supabase_client import supabase
+from llm_runner.run_model import call_local_llm
+
 
 load_dotenv()
 
@@ -47,8 +49,6 @@ REQUIRED_FIELDS = {
         "Legal Type": ["legal type", "الشكل القانوني", "company type"],
         "Expiry Date": ["expiry date", "تاريخ انتهاء", "expiration"],
         "Register No.": ["register no", "رقم السجل التجاري", "registration number"],
-        "Issue Date": ["issue date", "تاريخ الإصدار", "issuing date"],
-        "DCCI No.": ["dcci no", "عضوية الغرفة", "chamber number"],
         "License Members": ["license members", "الشركاء", "members", "shareholders"]
     },
     "eid": {
@@ -78,13 +78,10 @@ def encode_image(image_path: str) -> str:
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
     return f"data:image/{mime_type};base64,{image_b64}"
 
-def run_ocr(image_path: str) -> str:
+def run_ocr(image_path: str, model_name: str = LLAMA_MODEL_NAME) -> str:
     image_url = encode_image(image_path)
 
-    prompt = """You are an OCR system.Perform OCR on the provided image.
-- Preserve numbers, dates, and names accurately
-- Keep structure as much as possible
-- Return plain extracted text only
+    prompt = """You are an OCR system. Perform OCR on the provided image
 """
 
     headers = {
@@ -94,7 +91,7 @@ def run_ocr(image_path: str) -> str:
     }
 
     payload = {
-        "model": LLAMA_MODEL_NAME,
+        "model": model_name,
         "messages": [
             {
                 "role": "user",
@@ -161,19 +158,19 @@ def validate_fields(extracted: dict, doc_type: str) -> dict:
 # Main Pipeline
 # ---------------------------
 
-def process_document(user_email: str, document_id: str, file_path: str) -> dict:
+def process_document(user_email: str, document_id: str, file_path: str, model_name: str = LLAMA_MODEL_NAME) -> dict:
     """
     Full pipeline:
     1. Perform OCR
     2. Identify doc type
-    3. Extract fields
+    3. Extract fields using LLM with schema prompt
     4. Validate
     5. Save JSON into backend/documents/id/<user>/<doc_id>/output.json
     """
-    print(f"[INFO] Processing {file_path} for {user_email}")
+    print(f"[INFO] Processing {file_path} for {user_email} with model {model_name}")
 
     try:
-        raw_text = run_ocr(file_path)
+        raw_text = run_ocr(file_path, model_name)
     except Exception as e:
         raw_text = ""
         analysis = {
@@ -187,8 +184,28 @@ def process_document(user_email: str, document_id: str, file_path: str) -> dict:
         }
     else:
         doc_type = identify_document_type(raw_text)
-        extracted = extract_fields(raw_text, doc_type)
-        validation = validate_fields(extracted, doc_type)
+        # Prepare schema prompt
+        schema = REQUIRED_FIELDS.get(doc_type, {})
+        schema_prompt = (
+            f"You are an information extraction system. Extract the following fields from the document text according to this schema:\n"
+            f"{json.dumps(list(schema.keys()), indent=2)}\n"
+            "Return ONLY a valid JSON object with keys as field names and values as extracted values. Do not include any explanation or extra text.\n"
+            f"Document text:\n{raw_text}"
+        )
+        # Call LLM for extraction
+        llm_extracted = {}
+        try:
+            llm_response = call_local_llm(schema_prompt)
+            # Try to extract JSON from the response
+            json_start = llm_response.find('{')
+            json_end = llm_response.rfind('}') + 1
+            llm_json_str = llm_response[json_start:json_end]
+            llm_extracted = json.loads(llm_json_str)
+        except Exception as e:
+            print(f"[ERROR] LLM extraction failed: {e}")
+            llm_extracted = {}
+
+        validation = validate_fields(llm_extracted, doc_type)
 
         if doc_type == "unknown":
             status = f"❌ WRONG DOCUMENT: {file_path} is not a recognized document type."
@@ -201,7 +218,7 @@ def process_document(user_email: str, document_id: str, file_path: str) -> dict:
             "filename": os.path.basename(file_path),
             "document_type": doc_type,
             "raw_text": raw_text,
-            "extracted_fields": extracted,
+            "extracted_fields": llm_extracted,
             "validation": validation,
             "status_message": status,
             "is_valid": doc_type in ["commercial", "eid"] and validation["is_valid"]

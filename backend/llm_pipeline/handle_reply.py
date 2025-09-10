@@ -4,8 +4,11 @@ from ingestion.faq_retriever import retrieve_similar_chunks
 from llm_runner.prompt_templates import build_onboarding_prompt
 from llm_runner.run_model import call_local_llm
 from app.services.supabase_client import supabase
-from app.services.email_sender import send_email
+from app.services.email_sender import send_email, send_wrong_document_email
 from app.services.ocr_service import process_document
+
+LLAMA_MODEL_NAME = "meta-llama/llama-3.2-11b-vision-instruct"
+QWEN_MODEL_NAME = "qwen/qwen-2.5-vl-7b-instruct"
 
 from datetime import datetime
 import os
@@ -61,30 +64,20 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
             filedata = a["data"]
             if filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
                 filepath = os.path.join(save_dir, filename)
-                print(f"[DEBUG] Saving image attachment: {filepath} (size: {len(filedata)} bytes)")
                 with open(filepath, "wb") as f:
                     f.write(filedata)
                 image_files_saved.append(filename)
-            else:
-                print(f"[WARN] Skipping non-image file: {filename}")
-        
-        if not image_files_saved:
-            subject = "No Valid Documents Received"
-            body = "Please attach image files (PNG, JPG, JPEG, WEBP) containing your Commercial Registration Document and Resident Identity Card (EID)."
-            send_email(to_email=from_email, subject=subject, body=body)
-            print(f"[WARN] No image files found in attachments for: {from_email}")
-            return
-        
-        supabase.table("users").update({"onboarding_step": "document_verification"}).eq("email", from_email).execute()
-        print("[INFO] Running OCR for uploaded documents...")
-
-        # Run OCR for each image using process_document
-        for filename in image_files_saved:
+        # Assign models to attachments
+        for idx, filename in enumerate(image_files_saved):
             document_id = os.path.splitext(filename)[0]
             file_path = os.path.join(save_dir, filename)
+            if idx == 0:
+                model_name = LLAMA_MODEL_NAME
+            else:
+                model_name = QWEN_MODEL_NAME
             try:
-                process_document(from_email, document_id, file_path)
-                time.sleep(120)
+                process_document(from_email, document_id, file_path, model_name=model_name)
+                time.sleep(60)  # wait 5 minutes between OCR calls to avoid rate limits
             except Exception as e:
                 print(f"[ERROR] OCR failed for {filename}: {e}")
 
@@ -143,26 +136,83 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                 for filename, data in ocr_results.items()
                 if data.get("type") == "unknown"
             ]
-            
             summary_texts = []
             if wrong_docs:
                 for filename, doc_type in wrong_docs:
                     doc_info = ocr_results.get(filename, {})
                     raw_text = doc_info.get("raw_text", "")
+                    summary = ""
                     if raw_text:
                         prompt = (
-                            "Summarize the document and tell what it is and give it a title.\n"
+                            "Summarize the document and tell what the document is about and tell what it is and give it a title.\n"
                             "Document text:\n"
                             f"{raw_text}\n"
                         )
-                        llm_summary = call_local_llm(prompt)
-                        summary_texts.append(
-                            f"Here is the summary of document '{filename}':\n{llm_summary}\n"
-                        )
+                        summary = call_local_llm(prompt)
+                    summary_texts.append(summary)
+                    # Send formatted wrong document email
+                    required_docs = []
+                    if not doc_status["commercial"]:
+                        required_docs.append("Commercial Registration Document")
+                    if not doc_status["eid"]:
+                        required_docs.append("Resident Identity Card (EID)")
+                    send_wrong_document_email(from_email, filename, summary, required_docs)
             
             if not doc_status["missing"] and not wrong_docs:
-                subject = "Documents Received and Verified"
-                body = "Great! Both your Commercial Registration Document and Resident Identity Card (EID) have been successfully received and verified. Your onboarding will proceed to the next step."
+                # Check for missing fields in validated documents
+                missing_fields_msgs = []
+                for doc_name, doc_info in ocr_results.items():
+                    if doc_info.get("type") in ["commercial", "eid"]:
+                        validation = doc_info.get("validation", {})
+                        if not validation.get("is_valid", False):
+                            missing_fields = validation.get("missing_fields", [])
+                            if missing_fields:
+                                missing_fields_msgs.append(
+                                    f"• {doc_name}: Missing fields - {', '.join(missing_fields)}"
+                                )
+                if missing_fields_msgs:
+                    subject = "Documents Received but Missing Fields"
+                    body = (
+                        "Both your Commercial Registration Document and Resident Identity Card (EID) have been received and identified correctly.\n"
+                        "However, some required fields are missing:\n"
+                        + "\n".join(missing_fields_msgs)
+                        + "\n\nPlease resend the documents ensuring all required fields are visible and readable."
+                    )
+                    send_email(to_email=from_email, subject=subject, body=body)
+                    print(f"[INFO] Sent missing fields notification to: {from_email}")
+                    return
+                else:
+                    subject = "Documents Received and Verified"
+                    body = (
+                        "<html><body style='font-family:Arial,sans-serif;'>"
+                        "<div style='max-width:600px;margin:auto;padding:24px;background:#fff;border-radius:10px;box-shadow:0 2px 8px #eee;'>"
+                        "<h2 style='color:#4CAF50;'>Documents Verified</h2>"
+                        "<p>Dear User,</p>"
+                        "<p>Both your Commercial Registration Document and Resident Identity Card (EID) have been successfully received and verified.</p>"
+                        "<p>Your onboarding will proceed to the next step.</p>"
+                        "<p style='margin-top:32px;'>Best regards,<br><strong>Thrivv Onboarding Team</strong></p>"
+                        "</div></body></html>"
+                    )
+                    send_email(to_email=from_email, subject=subject, body=body, html=True)
+                    return
+
+            # If missing documents
+            if doc_status["missing"]:
+                subject = "Missing Document(s)"
+                missing_list = "".join([f"<li>{doc}</li>" for doc in doc_status["missing"]])
+                body = (
+                    f"<html><body style='font-family:Arial,sans-serif;'>"
+                    "<div style='max-width:600px;margin:auto;padding:24px;background:#fff;border-radius:10px;box-shadow:0 2px 8px #eee;'>"
+                    "<h2 style='color:#e53935;'>Missing Document(s)</h2>"
+                    "<p>Dear User,</p>"
+                    "<p>We have received your submission. However, the following document(s) are still required:</p>"
+                    f"<ul>{missing_list}</ul>"
+                    "<p>Please reply to this email with the missing document(s) attached as image files.</p>"
+                    "<p style='margin-top:32px;'>Best regards,<br><strong>Thrivv Onboarding Team</strong></p>"
+                    "</div></body></html>"
+                )
+                send_email(to_email=from_email, subject=subject, body=body, html=True)
+                return
             else:
                 subject = "Missing or Incorrect Document(s)"
                 body = "We have processed your submitted documents.\n\n"
@@ -188,6 +238,19 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
 
             # If missing or wrong documents, don't proceed further
             if doc_status["missing"] or wrong_docs:
+                # Delete wrong documents and their OCR results
+                for filename, _ in wrong_docs:
+                    # Remove image file
+                    image_path = os.path.join("backend", "documents", "id", from_email, filename)
+                    if os.path.exists(image_path):
+                        os.remove(image_path)
+                    # Remove OCR output directory
+                    doc_id = os.path.splitext(filename)[0]
+                    ocr_dir = os.path.join("backend", "documents", "id", from_email, doc_id)
+                    if os.path.exists(ocr_dir):
+                        import shutil
+                        shutil.rmtree(ocr_dir)
+                    print(f"[INFO] Deleted wrong document and OCR results: {filename}")
                 return
 
         except Exception as e:

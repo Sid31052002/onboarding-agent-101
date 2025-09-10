@@ -81,7 +81,7 @@ def encode_image(image_path: str) -> str:
 def run_ocr(image_path: str, model_name: str = LLAMA_MODEL_NAME) -> str:
     image_url = encode_image(image_path)
 
-    prompt = """You are an OCR system. Perform OCR on the provided image
+    prompt = """You are an OCR system. Perform OCR on the provided image and extract all text accurately.
 """
 
     headers = {

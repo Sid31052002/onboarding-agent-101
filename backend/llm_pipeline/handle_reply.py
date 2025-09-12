@@ -150,13 +150,23 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                         )
                         summary = call_local_llm(prompt)
                     summary_texts.append(summary)
-                    # Send formatted wrong document email
                     required_docs = []
                     if not doc_status["commercial"]:
                         required_docs.append("Commercial Registration Document")
                     if not doc_status["eid"]:
                         required_docs.append("Resident Identity Card (EID)")
                     send_wrong_document_email(from_email, filename, summary, required_docs)
+                    
+                    # --- NEW LOGIC: Delete wrong document and its OCR results after sending mail ---
+                    image_path = os.path.join("backend", "documents", "id", from_email, filename)
+                    if os.path.exists(image_path):
+                        os.remove(image_path)
+                    doc_id = os.path.splitext(filename)[0]
+                    ocr_dir = os.path.join("backend", "documents", "id", from_email, doc_id)
+                    if os.path.exists(ocr_dir):
+                        import shutil
+                        shutil.rmtree(ocr_dir)
+                    print(f"[INFO] Deleted wrong document and OCR results: {filename}")
             
             if not doc_status["missing"] and not wrong_docs:
                 # Check for missing fields in validated documents
@@ -247,6 +257,7 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                     # Remove OCR output directory
                     doc_id = os.path.splitext(filename)[0]
                     ocr_dir = os.path.join("backend", "documents", "id", from_email, doc_id)
+                    print(f"[DEBUG] Checking to delete OCR dir: {ocr_dir},{image_path}")
                     if os.path.exists(ocr_dir):
                         import shutil
                         shutil.rmtree(ocr_dir)

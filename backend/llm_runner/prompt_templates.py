@@ -38,6 +38,12 @@ def build_onboarding_prompt(
         instructions = (
             "Inform the user that all relevant documents have been received and are being verified. Ask if they have any other queries."
         )
+        
+    elif onboarding_step == "verification_in_progress":
+        instructions = (
+            "Inform the user that some documents have been received and are verified. Ask then to submit the remaining documents."
+        )
+        
     elif onboarding_step == "verification_complete":
         instructions = (
             "Congratulate the user for being onboarded and inform them that account details will be shared within 3-4 business days."

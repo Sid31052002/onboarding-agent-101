@@ -44,6 +44,72 @@ def check_documents_in_ocr(ocr_results: dict) -> dict:
     }
 
 def process_user_reply(from_email: str, body: str, attachments: list = None):
+    # Step 0: Check if last agent message was a validation request
+    convo_response = supabase.table("conversations").select("*").eq("user_email", from_email).order("timestamp", desc=True).limit(2).execute()
+    convo_history = convo_response.data if convo_response.data else []
+    last_agent_msg = None
+    for msg in convo_history:
+        if msg["role"] == "agent":
+            last_agent_msg = msg["message"]
+            break
+
+    print(f"[DEBUG] last_agent_msg: {last_agent_msg}")
+    print(f"[DEBUG] user reply: {body.strip().lower()}")
+
+    if last_agent_msg and "yes" in last_agent_msg:
+        print("[DEBUG] Validation request detected.")
+        if body.strip().lower() == "yes":
+            print("[DEBUG] User replied YES.")
+            # Check if both documents are present and validated
+            user_docs_dir = os.path.join("backend", "documents", "id", from_email)
+            ocr_results = {}
+            if os.path.exists(user_docs_dir):
+                for doc_dir in os.listdir(user_docs_dir):
+                    output_path = os.path.join(user_docs_dir, doc_dir, "output.json")
+                    if os.path.exists(output_path):
+                        with open(output_path, "r", encoding="utf-8") as f:
+                            analysis = json.load(f)
+                        ocr_results[doc_dir] = {
+                            "type": analysis.get("document_type", "unknown"),
+                            "is_valid": analysis.get("is_valid", False)
+                        }
+            
+            doc_status = check_documents_in_ocr(ocr_results)
+            print(f"[DEBUG] doc_status: {doc_status}")
+            if doc_status["commercial"] and doc_status["eid"]:
+                print("Changing onboarding_step to verification_complete in Supabase")
+                supabase.table("users").update({"onboarding_step": "verification_complete"}).eq("email", from_email).execute()
+                print(f"[INFO] User {from_email} confirmed both documents. Onboarding complete.")
+                return
+            else:
+                # Only one document present, ask for the missing one
+                missing = []
+                if not doc_status["commercial"]:
+                    missing.append("Commercial Registration Document")
+                if not doc_status["eid"]:
+                    missing.append("Resident Identity Card (EID)")
+                subject = "Please Submit Missing Document"
+                body_text = (
+                    "Thank you for submitting your document. We have received your "
+                    f"{'Commercial Registration Document' if doc_status['commercial'] else 'Resident Identity Card (EID)'}.\n"
+                    f"Please submit the following missing document(s) to continue onboarding:\n"
+                    + "\n".join([f"- {doc}" for doc in missing])
+                )
+                send_email(to_email=from_email, subject=subject, body=body_text)
+                supabase.table("users").update({"onboarding_step": "verification_in_progress"}).eq("email", from_email).execute()
+                print(f"[INFO] User {from_email} submitted one document. Requested missing document(s).")
+                return
+        else:
+            # Ask for both documents again
+            subject = "Document Correction Required"
+            body_text = (
+                "It appears there are corrections needed in your submitted information. "
+                "Please reply to this email with both your Commercial Registration Document and Resident Identity Card (EID) attached as image files."
+            )
+            send_email(to_email=from_email, subject=subject, body=body_text)
+            print(f"[INFO] User {from_email} did not confirm extracted fields. Requested both documents again.")
+            return
+
     # `Step 1: Get the user
     user_response = supabase.table("users").select("*").eq("email", from_email).execute()
     if not user_response.data or len(user_response.data) == 0:
@@ -171,9 +237,16 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
             if not doc_status["missing"] and not wrong_docs:
                 # Check for missing fields in validated documents
                 missing_fields_msgs = []
+                extracted_fields_msgs = []
                 for doc_name, doc_info in ocr_results.items():
                     if doc_info.get("type") in ["commercial", "eid"]:
                         validation = doc_info.get("validation", {})
+                        fields = doc_info.get("extracted_fields", {})
+                        if fields:
+                            field_lines = "\n".join([f"- {k}: {v}" for k, v in fields.items()])
+                            extracted_fields_msgs.append(
+                                f"{doc_info.get('type').capitalize()} Document ({doc_name}):\n{field_lines}"
+                            )
                         if not validation.get("is_valid", False):
                             missing_fields = validation.get("missing_fields", [])
                             if missing_fields:
@@ -192,18 +265,21 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                     print(f"[INFO] Sent missing fields notification to: {from_email}")
                     return
                 else:
-                    subject = "Documents Received and Verified"
+                    # Ask user to validate extracted fields
+                    subject = "Please Validate Your Extracted Information"
                     body = (
                         "<html><body style='font-family:Arial,sans-serif;'>"
                         "<div style='max-width:600px;margin:auto;padding:24px;background:#fff;border-radius:10px;box-shadow:0 2px 8px #eee;'>"
-                        "<h2 style='color:#4CAF50;'>Documents Verified</h2>"
+                        "<h2 style='color:#4CAF50;'>Extracted Information</h2>"
                         "<p>Dear User,</p>"
-                        "<p>Both your Commercial Registration Document and Resident Identity Card (EID) have been successfully received and verified.</p>"
-                        "<p>Your onboarding will proceed to the next step.</p>"
+                        "<p>We have extracted the following information from your submitted documents:</p>"
+                        f"<pre>{'<br><br>'.join(extracted_fields_msgs)}</pre>"
+                        "<p>Please reply <strong>Yes</strong> if all the information above is correct. If anything is incorrect, reply with the corrections or resubmit your documents.</p>"
                         "<p style='margin-top:32px;'>Best regards,<br><strong>Thrivv Onboarding Team</strong></p>"
                         "</div></body></html>"
                     )
                     send_email(to_email=from_email, subject=subject, body=body, html=True)
+                    print(f"[INFO] Sent extracted fields for validation to: {from_email}")
                     return
 
             # If missing documents

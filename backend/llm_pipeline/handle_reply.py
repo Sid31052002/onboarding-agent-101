@@ -6,6 +6,7 @@ from llm_runner.run_model import call_local_llm
 from app.services.supabase_client import supabase
 from app.services.email_sender import send_email, send_wrong_document_email
 from app.services.ocr_service import process_document
+from app.services.pdf_utils import pdf_to_images_pymupdf
 
 LLAMA_MODEL_NAME = "meta-llama/llama-3.2-11b-vision-instruct"
 QWEN_MODEL_NAME = "qwen/qwen-2.5-vl-7b-instruct"
@@ -125,6 +126,8 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
         os.makedirs(save_dir, exist_ok=True)
         
         image_files_saved = []
+        pdf_ocr_results = {}
+
         for a in attachments:
             filename = a["filename"]
             filedata = a["data"]
@@ -133,6 +136,32 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                 with open(filepath, "wb") as f:
                     f.write(filedata)
                 image_files_saved.append(filename)
+            elif filename.lower().endswith(".pdf"):
+                # Save PDF temporarily
+                pdf_path = os.path.join(save_dir, filename)
+                with open(pdf_path, "wb") as f:
+                    f.write(filedata)
+                # Convert PDF to images
+                pdf_images = pdf_to_images_pymupdf(pdf_path, save_dir)
+                pdf_image_names = [os.path.basename(img) for img in pdf_images]
+                image_files_saved.extend(pdf_image_names)
+
+                # OCR each image and collect results
+                pdf_results = []
+                for img_name in pdf_image_names:
+                    document_id = os.path.splitext(img_name)[0]
+                    file_path = os.path.join(save_dir, img_name)
+                    try:
+                        result = process_document(from_email, document_id, file_path, model_name=LLAMA_MODEL_NAME)
+                        pdf_results.append(result)
+                    except Exception as e:
+                        print(f"[ERROR] OCR failed for {img_name}: {e}")
+                # Save aggregated OCR results for the PDF
+                ocr_response_path = os.path.join(save_dir, "ocr-response.json")
+                with open(ocr_response_path, "w", encoding="utf-8") as f:
+                    json.dump(pdf_results, f, ensure_ascii=False, indent=2)
+                print(f"[INFO] Aggregated OCR response saved: {ocr_response_path}")
+
         # Assign models to attachments
         for idx, filename in enumerate(image_files_saved):
             document_id = os.path.splitext(filename)[0]
@@ -174,7 +203,22 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                         "validation": {},
                         "is_valid": False
                     }
-            # --- NEW LOGIC: Aggregate previous documents ---
+            # --- NEW LOGIC: Merge PDF ocr-response.json results ---
+            ocr_response_path = os.path.join(save_dir, "ocr-response.json")
+            if os.path.exists(ocr_response_path):
+                with open(ocr_response_path, "r", encoding="utf-8") as f:
+                    pdf_ocr_list = json.load(f)
+                for pdf_ocr in pdf_ocr_list:
+                    fname = pdf_ocr.get("filename", "")
+                    ocr_results[fname] = {
+                        "type": pdf_ocr.get("document_type", "unknown"),
+                        "raw_text": pdf_ocr.get("raw_text", ""),
+                        "status_message": pdf_ocr.get("status_message", ""),
+                        "extracted_fields": pdf_ocr.get("extracted_fields", {}),
+                        "validation": pdf_ocr.get("validation", {}),
+                        "is_valid": pdf_ocr.get("is_valid", False)
+                    }
+            # --- Aggregate previous documents as before ---
             user_docs_dir = os.path.join("backend", "documents", "id", from_email)
             if os.path.exists(user_docs_dir):
                 for doc_dir in os.listdir(user_docs_dir):
@@ -182,7 +226,6 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                     if os.path.exists(output_path):
                         with open(output_path, "r", encoding="utf-8") as f:
                             analysis = json.load(f)
-                        # Use doc_dir as key to avoid filename collision
                         ocr_results[doc_dir] = {
                             "type": analysis.get("document_type", "unknown"),
                             "raw_text": analysis.get("raw_text", ""),

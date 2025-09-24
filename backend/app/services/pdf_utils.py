@@ -21,11 +21,11 @@ def pdf_to_images_pymupdf(pdf_path, output_folder="output_images", dpi=200, fmt=
     return image_paths
 
 
-# Example usage
-if __name__ == "__main__":
-    images = pdf_to_images_pymupdf(
-        r"C:\Users\Dell\Downloads\Scripts_Flow_Updated.pdf",
-        output_folder="pdf_images",
-        dpi=300
-    )
-    print("Images saved:", images)
+# # Example usage
+# if __name__ == "__main__":
+#     images = pdf_to_images_pymupdf(
+#         r"C:\Users\Dell\Downloads\Scripts_Flow_Updated.pdf",
+#         output_folder="pdf_images",
+#         dpi=300
+#     )
+#     print("Images saved:", images)

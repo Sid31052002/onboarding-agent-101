@@ -1,5 +1,3 @@
-# backend/llm_pipeline/handle_reply.py
-
 from ingestion.faq_retriever import retrieve_similar_chunks
 from llm_runner.prompt_templates import build_onboarding_prompt
 from llm_runner.run_model import call_local_llm
@@ -15,6 +13,44 @@ from datetime import datetime
 import os
 import time
 import json
+
+def extract_license_members(members_data):
+    """
+    Extract member names from license members data, handling both string arrays and object arrays.
+    
+    Args:
+        members_data: Can be:
+            - List of strings: ["MEMBER1", "MEMBER2"]
+            - List of objects: [{"Name": "MEMBER1", "License No.": "123"}, {"Name": "MEMBER2", "License No.": "456"}]
+            - None or empty
+    
+    Returns:
+        List of member names (strings)
+    """
+    if not members_data or not isinstance(members_data, list):
+        return []
+    
+    member_names = []
+    for member in members_data:
+        if isinstance(member, str):
+            # Direct string format
+            member_names.append(member.strip())
+        elif isinstance(member, dict):
+            # Object format - extract name
+            name = member.get("Name") or member.get("name")
+            if name:
+                member_names.append(name.strip())
+        # Skip any other formats
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_names = []
+    for name in member_names:
+        if name and name not in seen:
+            seen.add(name)
+            unique_names.append(name)
+    
+    return unique_names
 
 def check_documents_in_ocr(ocr_results: dict) -> dict:
     """
@@ -92,7 +128,7 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                 subject = "Please Submit Missing Document"
                 body_text = (
                     "Thank you for submitting your document. We have received your "
-                    f"{'Commercial Registration Document' if doc_status['commercial'] else 'Resident Identity Card (EID)'}.\n"
+                    f"{'Commercial Registration Document' if doc_status['commercial'] else 'Resident Identity Card (EID'}.\n"
                     f"Please submit the following missing document(s) to continue onboarding:\n"
                     + "\n".join([f"- {doc}" for doc in missing])
                 )
@@ -111,13 +147,14 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
             print(f"[INFO] User {from_email} did not confirm extracted fields. Requested both documents again.")
             return
 
-    # `Step 1: Get the user
+    # Step 1: Get the user registration data
     user_response = supabase.table("users").select("*").eq("email", from_email).execute()
     if not user_response.data or len(user_response.data) == 0:
         print(f"[WARN] Email not found in users table: {from_email}")
         return
-
     user = user_response.data[0]
+    account_type = user.get("account_type")
+    ownership_type = user.get("ownership_type")
 
     # Save attachments to backend/documents/id/{email}/
     if attachments:
@@ -126,7 +163,7 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
         os.makedirs(save_dir, exist_ok=True)
         
         image_files_saved = []
-        pdf_ocr_results = {}
+        pdf_image_names = []  # Track images generated from PDFs
 
         for a in attachments:
             filename = a["filename"]
@@ -137,15 +174,12 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                     f.write(filedata)
                 image_files_saved.append(filename)
             elif filename.lower().endswith(".pdf"):
-                # Save PDF temporarily
                 pdf_path = os.path.join(save_dir, filename)
                 with open(pdf_path, "wb") as f:
                     f.write(filedata)
-                # Convert PDF to images
                 pdf_images = pdf_to_images_pymupdf(pdf_path, save_dir)
                 pdf_image_names = [os.path.basename(img) for img in pdf_images]
                 image_files_saved.extend(pdf_image_names)
-
                 # OCR each image and collect results
                 pdf_results = []
                 for img_name in pdf_image_names:
@@ -156,25 +190,164 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                         pdf_results.append(result)
                     except Exception as e:
                         print(f"[ERROR] OCR failed for {img_name}: {e}")
-                # Save aggregated OCR results for the PDF
                 ocr_response_path = os.path.join(save_dir, "ocr-response.json")
                 with open(ocr_response_path, "w", encoding="utf-8") as f:
                     json.dump(pdf_results, f, ensure_ascii=False, indent=2)
                 print(f"[INFO] Aggregated OCR response saved: {ocr_response_path}")
 
-        # Assign models to attachments
-        for idx, filename in enumerate(image_files_saved):
+        # Assign models to attachments (skip PDF images for Qwen)
+        for filename in image_files_saved:
+            if filename in pdf_image_names:
+                continue  # Skip PDF images, already processed with Llama
             document_id = os.path.splitext(filename)[0]
             file_path = os.path.join(save_dir, filename)
-            if idx == 0:
-                model_name = LLAMA_MODEL_NAME
-            else:
-                model_name = QWEN_MODEL_NAME
+            # Always use Qwen for image OCR
             try:
-                process_document(from_email, document_id, file_path, model_name=model_name)
-                time.sleep(60)  # wait 5 minutes between OCR calls to avoid rate limits
+                process_document(from_email, document_id, file_path, model_name=QWEN_MODEL_NAME)
+                time.sleep(60)
             except Exception as e:
                 print(f"[ERROR] OCR failed for {filename}: {e}")
+
+        # --- ENHANCED LOGIC: Partnership License Members Processing ---
+        if account_type == "Corporate" and ownership_type in ["@Multiple Owners", "Partnership"]:
+            print(f"[DEBUG] Processing partnership/multiple owners for {from_email}")
+            
+            # Check OCR response from PDF processing
+            ocr_response_path = os.path.join(save_dir, "ocr-response.json")
+            member_names = []
+            
+            if os.path.exists(ocr_response_path):
+                print(f"[DEBUG] Reading OCR response from: {ocr_response_path}")
+                with open(ocr_response_path, "r", encoding="utf-8") as f:
+                    ocr_results = json.load(f)
+                
+                # Look for commercial document with license members
+                for doc in ocr_results:
+                    filename = doc.get("filename", "")
+                    doc_type = doc.get("document_type", "")
+                    
+                    print(f"[DEBUG] Checking document: {filename}, type: {doc_type}")
+                    
+                    # Check if this is page 1 (main license page) and commercial type
+                    if "page_1" in filename.lower() and doc_type == "commercial":
+                        extracted_fields = doc.get("extracted_fields", {})
+                        license_members = extracted_fields.get("License Members", [])
+                        
+                        print(f"[DEBUG] Found license members in {filename}: {license_members}")
+                        
+                        # Extract member names using the new function
+                        member_names = extract_license_members(license_members)
+                        print(f"[DEBUG] Extracted member names: {member_names}")
+                        break
+            
+            # Also check individual OCR results from image processing
+            if not member_names:
+                print("[DEBUG] No members found in PDF OCR, checking individual image OCR results")
+                for filename in image_files_saved:
+                    if "page_1" in filename.lower() or filename.lower().startswith("page1"):
+                        document_id = os.path.splitext(filename)[0]
+                        output_path = os.path.join(save_dir, document_id, "output.json")
+                        if os.path.exists(output_path):
+                            with open(output_path, "r", encoding="utf-8") as f:
+                                analysis = json.load(f)
+                            
+                            if analysis.get("document_type") == "commercial":
+                                extracted_fields = analysis.get("extracted_fields", {})
+                                license_members = extracted_fields.get("License Members", [])
+                                member_names = extract_license_members(license_members)
+                                print(f"[DEBUG] Found members in individual OCR {filename}: {member_names}")
+                                if member_names:
+                                    break
+            
+            # Create directories and send email if members found
+            if member_names:
+                # --- NEW LOGIC: If only one member, re-run full OCR pipeline ---
+                if len(member_names) == 1:
+                    print(f"[WARN] Only one license member extracted: {member_names}. Re-running full OCR pipeline.")
+                    # Find the original PDF file in the folder
+                    pdf_files = [f for f in os.listdir(save_dir) if f.lower().endswith(".pdf")]
+                    if pdf_files:
+                        original_pdf = pdf_files[0]
+                        # Remove all files except the original PDF
+                        for f in os.listdir(save_dir):
+                            if f != original_pdf:
+                                file_path = os.path.join(save_dir, f)
+                                if os.path.isfile(file_path):
+                                    os.remove(file_path)
+                                elif os.path.isdir(file_path):
+                                    import shutil
+                                    shutil.rmtree(file_path)
+                        print(f"[INFO] Cleaned up folder, kept only: {original_pdf}")
+                        # Re-split PDF to images
+                        pdf_path = os.path.join(save_dir, original_pdf)
+                        pdf_images = pdf_to_images_pymupdf(pdf_path, save_dir)
+                        pdf_image_names = [os.path.basename(img) for img in pdf_images]
+                        # Re-run OCR for each image
+                        pdf_results = []
+                        for img_name in pdf_image_names:
+                            document_id = os.path.splitext(img_name)[0]
+                            file_path = os.path.join(save_dir, img_name)
+                            try:
+                                result = process_document(from_email, document_id, file_path, model_name=LLAMA_MODEL_NAME)
+                                pdf_results.append(result)
+                            except Exception as e:
+                                print(f"[ERROR] OCR failed for {img_name}: {e}")
+                        # Save new OCR results
+                        ocr_response_path = os.path.join(save_dir, "ocr-response.json")
+                        with open(ocr_response_path, "w", encoding="utf-8") as f:
+                            json.dump(pdf_results, f, ensure_ascii=False, indent=2)
+                        print(f"[INFO] Re-aggregated OCR response saved: {ocr_response_path}")
+                        # Extract members again from new OCR results
+                        member_names = []
+                        for doc in pdf_results:
+                            filename = doc.get("filename", "")
+                            doc_type = doc.get("document_type", "")
+                            if "page_1" in filename.lower() and doc_type == "commercial":
+                                extracted_fields = doc.get("extracted_fields", {})
+                                license_members = extracted_fields.get("License Members", [])
+                                member_names = extract_license_members(license_members)
+                                print(f"[DEBUG] After re-run, extracted member names: {member_names}")
+                                break
+                
+                print(f"[INFO] Creating directories for {len(member_names)} license members")
+                
+                # Create directory for each member INSIDE the user's email directory
+                base_docs_dir = os.path.join("backend", "documents", "id", from_email)
+                for member_name in member_names:
+                    member_dir = os.path.join(base_docs_dir, member_name)
+                    os.makedirs(member_dir, exist_ok=True)
+                    print(f"[DEBUG] Created directory: {member_dir}")
+                
+                # Send email requesting documents for each member
+                member_list_html = "".join([f"<li><strong>{name}</strong></li>" for name in member_names])
+                subject = "Documents Required for All License Members"
+                body_html = (
+                    f"<html><body style='font-family:Arial,sans-serif;color:#333;'>"
+                    "<div style='max-width:600px;margin:auto;padding:24px;background:#fff;border-radius:10px;box-shadow:0 2px 8px #eee;'>"
+                    "<h2 style='color:#4CAF50;margin-bottom:20px;'>Documents Required for All License Members</h2>"
+                    "<p>Dear User,</p>"
+                    "<p>We have successfully processed your Commercial Registration Document and identified the following license members:</p>"
+                    f"<ul style='background:#f8f9fa;padding:15px;border-radius:5px;'>{member_list_html}</ul>"
+                    "<p><strong>Required Documents for Each Member:</strong></p>"
+                    "<ul style='margin-left:20px;'>"
+                    "<li>Commercial Registration Document</li>"
+                    "<li>Emirates ID (EID)</li>"
+                    "</ul>"
+                    "<p>Please reply to this email with the required documents for all members listed above attached as image files or PDF files.</p>"
+                    "<p><em>Note: You can attach multiple documents in a single email. Please ensure the documents are clear and readable.</em></p>"
+                    "<p style='margin-top:32px;'>Best regards,<br><strong>Thrivv Onboarding Team</strong></p>"
+                    "</div></body></html>"
+                )
+                
+                send_email(to_email=from_email, subject=subject, body=body_html, html=True)
+                
+                # Update onboarding step
+                supabase.table("users").update({"onboarding_step": "member_documents_required"}).eq("email", from_email).execute()
+                
+                print(f"[INFO] Successfully processed partnership. Requested documents for members: {', '.join(member_names)}")
+                return
+            else:
+                print("[WARN] No license members found in commercial document for partnership/multiple owners")
 
         # Now extract structured OCR results
         try:
@@ -203,7 +376,7 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                         "validation": {},
                         "is_valid": False
                     }
-            # --- NEW LOGIC: Merge PDF ocr-response.json results ---
+            # --- LOGIC: Merge PDF ocr-response.json results ---
             ocr_response_path = os.path.join(save_dir, "ocr-response.json")
             if os.path.exists(ocr_response_path):
                 with open(ocr_response_path, "r", encoding="utf-8") as f:
@@ -266,7 +439,7 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                         required_docs.append("Resident Identity Card (EID)")
                     send_wrong_document_email(from_email, filename, summary, required_docs)
                     
-                    # --- NEW LOGIC: Delete wrong document and its OCR results after sending mail ---
+                    # Delete wrong document and its OCR results after sending mail
                     image_path = os.path.join("backend", "documents", "id", from_email, filename)
                     if os.path.exists(image_path):
                         os.remove(image_path)
@@ -407,7 +580,7 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
     convo_history = convo_response.data if convo_response.data else []
     convo_context = "\n".join([f"{msg['role']}: {msg['message']}" for msg in convo_history])
 
-    # dd onboarding_step to context
+    # Add onboarding_step to context
     onboarding_step = user.get("onboarding_step", "welcome")
     full_context = f"Onboarding Step: {onboarding_step}\n\n{convo_context}\n\nFAQ:\n{faq_context}"
 

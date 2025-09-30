@@ -1,3 +1,4 @@
+# backend/llm_pipeline/handle_reply.py
 from ingestion.faq_retriever import retrieve_similar_chunks
 from llm_runner.prompt_templates import build_onboarding_prompt
 from llm_runner.run_model import call_local_llm
@@ -52,6 +53,31 @@ def extract_license_members(members_data):
     
     return unique_names
 
+def get_member_progress(user_email):
+    """
+    Load member processing progress from JSON file.
+    Returns: dict with 'members' list and 'current_index'
+    """
+    progress_file = os.path.join("backend", "documents", "id", user_email, "member_progress.json")
+    if os.path.exists(progress_file):
+        with open(progress_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return None
+
+def save_member_progress(user_email, members, current_index):
+    """
+    Save member processing progress to JSON file.
+    """
+    progress_file = os.path.join("backend", "documents", "id", user_email, "member_progress.json")
+    progress_data = {
+        "members": members,
+        "current_index": current_index,
+        "updated_at": datetime.utcnow().isoformat()
+    }
+    with open(progress_file, "w", encoding="utf-8") as f:
+        json.dump(progress_data, f, ensure_ascii=False, indent=2)
+    print(f"[DEBUG] Saved member progress: {progress_data}")
+
 def check_documents_in_ocr(ocr_results: dict) -> dict:
     """
     Checks OCR results for presence of commercial and eid documents.
@@ -80,8 +106,246 @@ def check_documents_in_ocr(ocr_results: dict) -> dict:
         "missing": missing
     }
 
+def check_member_documents(user_email, member_name):
+    """
+    Check if a specific member has both required documents.
+    Returns: dict with OCR results for that member's folder
+    """
+    member_dir = os.path.join("backend", "documents", "id", user_email, member_name)
+    ocr_results = {}
+    
+    if not os.path.exists(member_dir):
+        return ocr_results
+    
+    # Check all subdirectories in member folder for output.json
+    for item in os.listdir(member_dir):
+        item_path = os.path.join(member_dir, item)
+        if os.path.isdir(item_path):
+            output_path = os.path.join(item_path, "output.json")
+            if os.path.exists(output_path):
+                with open(output_path, "r", encoding="utf-8") as f:
+                    analysis = json.load(f)
+                ocr_results[item] = {
+                    "type": analysis.get("document_type", "unknown"),
+                    "raw_text": analysis.get("raw_text", ""),
+                    "status_message": analysis.get("status_message", ""),
+                    "extracted_fields": analysis.get("extracted_fields", {}),
+                    "validation": analysis.get("validation", {}),
+                    "is_valid": analysis.get("is_valid", False)
+                }
+    
+    return ocr_results
+
+def process_member_documents(user_email, member_name, attachments):
+    """
+    Process documents for a specific member.
+    Returns: True if EID doc valid, False otherwise
+    """
+    member_dir = os.path.join("backend", "documents", "id", user_email, member_name)
+    
+    print(f"[DEBUG] Processing documents for member: {member_name}")
+    
+    # Save attachments to member's folder
+    image_files_saved = []
+    pdf_image_names = []
+    
+    for a in attachments:
+        filename = a["filename"]
+        filedata = a["data"]
+        
+        if filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+            filepath = os.path.join(member_dir, filename)
+            with open(filepath, "wb") as f:
+                f.write(filedata)
+            image_files_saved.append(filename)
+            
+        elif filename.lower().endswith(".pdf"):
+            pdf_path = os.path.join(member_dir, filename)
+            with open(pdf_path, "wb") as f:
+                f.write(filedata)
+            pdf_images = pdf_to_images_pymupdf(pdf_path, member_dir)
+            pdf_image_names = [os.path.basename(img) for img in pdf_images]
+            image_files_saved.extend(pdf_image_names)
+            
+            # OCR each PDF image
+            for img_name in pdf_image_names:
+                document_id = os.path.splitext(img_name)[0]
+                file_path = os.path.join(member_dir, img_name)
+                try:
+                    process_document(f"{user_email}/{member_name}", document_id, file_path, model_name=LLAMA_MODEL_NAME)
+                    time.sleep(60)
+                except Exception as e:
+                    print(f"[ERROR] OCR failed for {img_name}: {e}")
+    
+    # Process regular images with Qwen
+    for filename in image_files_saved:
+        if filename in pdf_image_names:
+            continue
+        document_id = os.path.splitext(filename)[0]
+        file_path = os.path.join(member_dir, filename)
+        try:
+            process_document(f"{user_email}/{member_name}", document_id, file_path, model_name=QWEN_MODEL_NAME)
+            time.sleep(60)
+        except Exception as e:
+            print(f"[ERROR] OCR failed for {filename}: {e}")
+    
+    # Check OCR results for this member
+    ocr_results = check_member_documents(user_email, member_name)
+    # --- CHANGED LOGIC: Only require EID for each member ---
+    eid_present = False
+    eid_info = None
+    for doc_name, doc_info in ocr_results.items():
+        if doc_info.get("type") == "eid":
+            eid_present = True
+            eid_info = doc_info
+            break
+
+    if not eid_present:
+        subject = f"Missing EID Document for {member_name}"
+        body_html = (
+            f"<html><body style='font-family:Arial,sans-serif;color:#333;'>"
+            "<div style='max-width:600px;margin:auto;padding:24px;background:#fff;border-radius:10px;box-shadow:0 2px 8px #eee;'>"
+            f"<h2 style='color:#e53935;'>Missing EID Document for {member_name}</h2>"
+            "<p>Dear User,</p>"
+            f"<p>Please submit the Resident Identity Card (EID) for <strong>{member_name}</strong> as an image or PDF file.</p>"
+            "<p style='margin-top:32px;'>Best regards,<br><strong>Thrivv Onboarding Team</strong></p>"
+            "</div></body></html>"
+        )
+        send_email(to_email=user_email, subject=subject, body=body_html, html=True)
+        return False
+
+    # Validate EID fields
+    validation = eid_info.get("validation", {})
+    fields = eid_info.get("extracted_fields", {})
+    missing_fields_msgs = []
+    extracted_fields_msgs = []
+    if fields:
+        field_lines = "\n".join([f"- {k}: {v}" for k, v in fields.items()])
+        extracted_fields_msgs.append(
+            f"EID Document ({doc_name}):\n{field_lines}"
+        )
+    if not validation.get("is_valid", False):
+        missing_fields = validation.get("missing_fields", [])
+        if missing_fields:
+            missing_fields_msgs.append(
+                f"• {doc_name}: Missing fields - {', '.join(missing_fields)}"
+            )
+    if missing_fields_msgs:
+        subject = f"EID Document for {member_name} - Missing Fields"
+        body_html = (
+            f"<html><body style='font-family:Arial,sans-serif;color:#333;'>"
+            "<div style='max-width:600px;margin:auto;padding:24px;background:#fff;border-radius:10px;box-shadow:0 2px 8px #eee;'>"
+            f"<h2 style='color:#ff9800;'>Missing Fields in EID Document for {member_name}</h2>"
+            "<p>Dear User,</p>"
+            f"<p>The EID document for <strong>{member_name}</strong> is missing required fields:</p>"
+            "<ul>"
+            + "".join([f"<li>{msg}</li>" for msg in missing_fields_msgs])
+            + "</ul>"
+            f"<p>Please resend the EID document for <strong>{member_name}</strong> ensuring all required fields are visible and readable.</p>"
+            "<p style='margin-top:32px;'>Best regards,<br><strong>Thrivv Onboarding Team</strong></p>"
+            "</div></body></html>"
+        )
+        send_email(to_email=user_email, subject=subject, body=body_html, html=True)
+        return False
+
+    # All valid - send success message
+    subject = f"EID Document Verified for {member_name}"
+    body_html = (
+        f"<html><body style='font-family:Arial,sans-serif;color:#333;'>"
+        "<div style='max-width:600px;margin:auto;padding:24px;background:#fff;border-radius:10px;box-shadow:0 2px 8px #eee;'>"
+        f"<h2 style='color:#4CAF50;'>EID Document Verified for {member_name}</h2>"
+        "<p>Dear User,</p>"
+        f"<p>The EID document for <strong>{member_name}</strong> has been successfully verified!</p>"
+        "<p><strong>Extracted Information:</strong></p>"
+        f"<pre>{'<br><br>'.join(extracted_fields_msgs)}</pre>"
+        "<p style='margin-top:32px;'>Best regards,<br><strong>Thrivv Onboarding Team</strong></p>"
+        "</div></body></html>"
+    )
+    send_email(to_email=user_email, subject=subject, body=body_html, html=True)
+    return True
+
 def process_user_reply(from_email: str, body: str, attachments: list = None):
-    # Step 0: Check if last agent message was a validation request
+    # Step 0: Get user data
+    user_response = supabase.table("users").select("*").eq("email", from_email).execute()
+    if not user_response.data or len(user_response.data) == 0:
+        print(f"[WARN] Email not found in users table: {from_email}")
+        return
+    
+    user = user_response.data[0]
+    account_type = user.get("account_type")
+    ownership_type = user.get("ownership_type")
+    onboarding_step = user.get("onboarding_step", "welcome")
+    
+    # Check if we're in member document collection mode
+    if account_type == "Corporate" and ownership_type in ["@Multiple Owners", "Partnership"]:
+        progress = get_member_progress(from_email)
+        
+        # If we have member progress, we're collecting member documents
+        if progress and attachments:
+            members = progress["members"]
+            current_index = progress["current_index"]
+            
+            if current_index < len(members):
+                current_member = members[current_index]
+                print(f"[INFO] Processing documents for member {current_index + 1}/{len(members)}: {current_member}")
+                
+                # Process documents for current member
+                is_valid = process_member_documents(from_email, current_member, attachments)
+                
+                if is_valid:
+                    # Move to next member
+                    current_index += 1
+                    
+                    if current_index < len(members):
+                        # Request documents for next member
+                        next_member = members[current_index]
+                        save_member_progress(from_email, members, current_index)
+                        
+                        subject = f"Documents Required for {next_member}"
+                        body_html = (
+                            f"<html><body style='font-family:Arial,sans-serif;color:#333;'>"
+                            "<div style='max-width:600px;margin:auto;padding:24px;background:#fff;border-radius:10px;box-shadow:0 2px 8px #eee;'>"
+                            f"<h2 style='color:#4CAF50;'>Documents Required for {next_member}</h2>"
+                            "<p>Dear User,</p>"
+                            f"<p>Great! We've verified the documents for <strong>{members[current_index - 1]}</strong>.</p>"
+                            f"<p>Now, please submit the following documents for <strong>{next_member}</strong> (Member {current_index + 1} of {len(members)}):</p>"
+                            "<ul style='margin-left:20px;'>"
+                            "<li>Resident Identity Card (EID)</li>"
+                            "</ul>"
+                            "<p>Please reply to this email with the required document attached as image. </p>"
+                            "<p style='margin-top:32px;'>Best regards,<br><strong>Thrivv Onboarding Team</strong></p>"
+                            "</div></body></html>"
+                        )
+                        send_email(to_email=from_email, subject=subject, body=body_html, html=True)
+                        print(f"[INFO] Requested documents for next member: {next_member}")
+                    else:
+                        # All members processed
+                        supabase.table("users").update({"onboarding_step": "verification_complete"}).eq("email", from_email).execute()
+                        
+                        subject = "All Member Documents Verified - Onboarding Complete!"
+                        body_html = (
+                            f"<html><body style='font-family:Arial,sans-serif;color:#333;'>"
+                            "<div style='max-width:600px;margin:auto;padding:24px;background:#fff;border-radius:10px;box-shadow:0 2px 8px #eee;'>"
+                            "<h2 style='color:#4CAF50;'>🎉 All Member Documents Verified!</h2>"
+                            "<p>Dear User,</p>"
+                            "<p>Congratulations! We have successfully verified documents for all {len(members)} license members:</p>"
+                            "<ul>"
+                            + "".join([f"<li><strong>{name}</strong></li>" for name in members])
+                            + "</ul>"
+                            "<p>Your onboarding process is now complete. Welcome to Thrivv!</p>"
+                            "<p style='margin-top:32px;'>Best regards,<br><strong>Thrivv Onboarding Team</strong></p>"
+                            "</div></body></html>"
+                        )
+                        send_email(to_email=from_email, subject=subject, body=body_html, html=True)
+                        print(f"[INFO] All members processed for {from_email}. Onboarding complete!")
+                else:
+                    # Keep same index, user needs to resubmit
+                    save_member_progress(from_email, members, current_index)
+                    print(f"[INFO] Waiting for correct documents for member: {current_member}")
+                
+                return
+    
+    # Original validation request flow
     convo_response = supabase.table("conversations").select("*").eq("user_email", from_email).order("timestamp", desc=True).limit(2).execute()
     convo_history = convo_response.data if convo_response.data else []
     last_agent_msg = None
@@ -97,7 +361,6 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
         print("[DEBUG] Validation request detected.")
         if body.strip().lower() == "yes":
             print("[DEBUG] User replied YES.")
-            # Check if both documents are present and validated
             user_docs_dir = os.path.join("backend", "documents", "id", from_email)
             ocr_results = {}
             if os.path.exists(user_docs_dir):
@@ -119,7 +382,6 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                 print(f"[INFO] User {from_email} confirmed both documents. Onboarding complete.")
                 return
             else:
-                # Only one document present, ask for the missing one
                 missing = []
                 if not doc_status["commercial"]:
                     missing.append("Commercial Registration Document")
@@ -137,7 +399,6 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                 print(f"[INFO] User {from_email} submitted one document. Requested missing document(s).")
                 return
         else:
-            # Ask for both documents again
             subject = "Document Correction Required"
             body_text = (
                 "It appears there are corrections needed in your submitted information. "
@@ -147,15 +408,6 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
             print(f"[INFO] User {from_email} did not confirm extracted fields. Requested both documents again.")
             return
 
-    # Step 1: Get the user registration data
-    user_response = supabase.table("users").select("*").eq("email", from_email).execute()
-    if not user_response.data or len(user_response.data) == 0:
-        print(f"[WARN] Email not found in users table: {from_email}")
-        return
-    user = user_response.data[0]
-    account_type = user.get("account_type")
-    ownership_type = user.get("ownership_type")
-
     # Save attachments to backend/documents/id/{email}/
     if attachments:
         print(f"[DEBUG] Attachments received: {[a['filename'] for a in attachments]}")
@@ -163,7 +415,7 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
         os.makedirs(save_dir, exist_ok=True)
         
         image_files_saved = []
-        pdf_image_names = []  # Track images generated from PDFs
+        pdf_image_names = []
 
         for a in attachments:
             filename = a["filename"]
@@ -180,13 +432,12 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                 pdf_images = pdf_to_images_pymupdf(pdf_path, save_dir)
                 pdf_image_names = [os.path.basename(img) for img in pdf_images]
                 image_files_saved.extend(pdf_image_names)
-                # OCR each image and collect results
                 pdf_results = []
                 for img_name in pdf_image_names:
                     document_id = os.path.splitext(img_name)[0]
                     file_path = os.path.join(save_dir, img_name)
                     try:
-                        result = process_document(from_email, document_id, file_path, model_name=LLAMA_MODEL_NAME)
+                        result = process_document(f"{from_email}", document_id, file_path, model_name=LLAMA_MODEL_NAME)
                         pdf_results.append(result)
                     except Exception as e:
                         print(f"[ERROR] OCR failed for {img_name}: {e}")
@@ -195,15 +446,13 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                     json.dump(pdf_results, f, ensure_ascii=False, indent=2)
                 print(f"[INFO] Aggregated OCR response saved: {ocr_response_path}")
 
-        # Assign models to attachments (skip PDF images for Qwen)
         for filename in image_files_saved:
             if filename in pdf_image_names:
-                continue  # Skip PDF images, already processed with Llama
+                continue
             document_id = os.path.splitext(filename)[0]
             file_path = os.path.join(save_dir, filename)
-            # Always use Qwen for image OCR
             try:
-                process_document(from_email, document_id, file_path, model_name=QWEN_MODEL_NAME)
+                process_document(f"{from_email}", document_id, file_path, model_name=QWEN_MODEL_NAME)
                 time.sleep(60)
             except Exception as e:
                 print(f"[ERROR] OCR failed for {filename}: {e}")
@@ -212,7 +461,6 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
         if account_type == "Corporate" and ownership_type in ["@Multiple Owners", "Partnership"]:
             print(f"[DEBUG] Processing partnership/multiple owners for {from_email}")
             
-            # Check OCR response from PDF processing
             ocr_response_path = os.path.join(save_dir, "ocr-response.json")
             member_names = []
             
@@ -221,26 +469,22 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                 with open(ocr_response_path, "r", encoding="utf-8") as f:
                     ocr_results = json.load(f)
                 
-                # Look for commercial document with license members
                 for doc in ocr_results:
                     filename = doc.get("filename", "")
                     doc_type = doc.get("document_type", "")
                     
                     print(f"[DEBUG] Checking document: {filename}, type: {doc_type}")
                     
-                    # Check if this is page 1 (main license page) and commercial type
                     if "page_1" in filename.lower() and doc_type == "commercial":
                         extracted_fields = doc.get("extracted_fields", {})
                         license_members = extracted_fields.get("License Members", [])
                         
                         print(f"[DEBUG] Found license members in {filename}: {license_members}")
                         
-                        # Extract member names using the new function
                         member_names = extract_license_members(license_members)
                         print(f"[DEBUG] Extracted member names: {member_names}")
                         break
             
-            # Also check individual OCR results from image processing
             if not member_names:
                 print("[DEBUG] No members found in PDF OCR, checking individual image OCR results")
                 for filename in image_files_saved:
@@ -259,16 +503,12 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                                 if member_names:
                                     break
             
-            # Create directories and send email if members found
             if member_names:
-                # --- NEW LOGIC: If only one member, re-run full OCR pipeline ---
                 if len(member_names) == 1:
                     print(f"[WARN] Only one license member extracted: {member_names}. Re-running full OCR pipeline.")
-                    # Find the original PDF file in the folder
                     pdf_files = [f for f in os.listdir(save_dir) if f.lower().endswith(".pdf")]
                     if pdf_files:
                         original_pdf = pdf_files[0]
-                        # Remove all files except the original PDF
                         for f in os.listdir(save_dir):
                             if f != original_pdf:
                                 file_path = os.path.join(save_dir, f)
@@ -278,26 +518,22 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                                     import shutil
                                     shutil.rmtree(file_path)
                         print(f"[INFO] Cleaned up folder, kept only: {original_pdf}")
-                        # Re-split PDF to images
                         pdf_path = os.path.join(save_dir, original_pdf)
                         pdf_images = pdf_to_images_pymupdf(pdf_path, save_dir)
                         pdf_image_names = [os.path.basename(img) for img in pdf_images]
-                        # Re-run OCR for each image
                         pdf_results = []
                         for img_name in pdf_image_names:
                             document_id = os.path.splitext(img_name)[0]
                             file_path = os.path.join(save_dir, img_name)
                             try:
-                                result = process_document(from_email, document_id, file_path, model_name=LLAMA_MODEL_NAME)
+                                result = process_document(f"{from_email}", document_id, file_path, model_name=LLAMA_MODEL_NAME)
                                 pdf_results.append(result)
                             except Exception as e:
                                 print(f"[ERROR] OCR failed for {img_name}: {e}")
-                        # Save new OCR results
                         ocr_response_path = os.path.join(save_dir, "ocr-response.json")
                         with open(ocr_response_path, "w", encoding="utf-8") as f:
                             json.dump(pdf_results, f, ensure_ascii=False, indent=2)
                         print(f"[INFO] Re-aggregated OCR response saved: {ocr_response_path}")
-                        # Extract members again from new OCR results
                         member_names = []
                         for doc in pdf_results:
                             filename = doc.get("filename", "")
@@ -318,23 +554,27 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                     os.makedirs(member_dir, exist_ok=True)
                     print(f"[DEBUG] Created directory: {member_dir}")
                 
-                # Send email requesting documents for each member
-                member_list_html = "".join([f"<li><strong>{name}</strong></li>" for name in member_names])
-                subject = "Documents Required for All License Members"
+                # Save member progress - start with first member (index 0)
+                save_member_progress(from_email, member_names, 0)
+                
+                # Request documents for FIRST member only
+                first_member = member_names[0]
+                subject = f"Documents Required for {first_member}"
                 body_html = (
                     f"<html><body style='font-family:Arial,sans-serif;color:#333;'>"
                     "<div style='max-width:600px;margin:auto;padding:24px;background:#fff;border-radius:10px;box-shadow:0 2px 8px #eee;'>"
-                    "<h2 style='color:#4CAF50;margin-bottom:20px;'>Documents Required for All License Members</h2>"
+                    f"<h2 style='color:#4CAF50;'>Documents Required for {first_member}</h2>"
                     "<p>Dear User,</p>"
                     "<p>We have successfully processed your Commercial Registration Document and identified the following license members:</p>"
-                    f"<ul style='background:#f8f9fa;padding:15px;border-radius:5px;'>{member_list_html}</ul>"
-                    "<p><strong>Required Documents for Each Member:</strong></p>"
+                    "<ul style='background:#f8f9fa;padding:15px;border-radius:5px;'>"
+                    + "".join([f"<li><strong>{name}</strong></li>" for name in member_names])
+                    + "</ul>"
+                    f"<p>We will collect documents for each member one by one. Let's start with <strong>{first_member}</strong> (Member 1 of {len(member_names)}).</p>"
+                    "<p><strong>Required Documents for {first_member}:</strong></p>"
                     "<ul style='margin-left:20px;'>"
-                    "<li>Commercial Registration Document</li>"
-                    "<li>Emirates ID (EID)</li>"
+                    "<li>Resident Identity Card (EID)</li>"
                     "</ul>"
-                    "<p>Please reply to this email with the required documents for all members listed above attached as image files or PDF files.</p>"
-                    "<p><em>Note: You can attach multiple documents in a single email. Please ensure the documents are clear and readable.</em></p>"
+                    "<p>Please reply to this email with the required documents for <strong>{first_member}</strong> attached as image or PDF files.</p>"
                     "<p style='margin-top:32px;'>Best regards,<br><strong>Thrivv Onboarding Team</strong></p>"
                     "</div></body></html>"
                 )
@@ -344,14 +584,13 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                 # Update onboarding step
                 supabase.table("users").update({"onboarding_step": "member_documents_required"}).eq("email", from_email).execute()
                 
-                print(f"[INFO] Successfully processed partnership. Requested documents for members: {', '.join(member_names)}")
+                print(f"[INFO] Successfully processed partnership. Requested documents for first member: {first_member}")
                 return
             else:
                 print("[WARN] No license members found in commercial document for partnership/multiple owners")
 
-        # Now extract structured OCR results
+        # Now extract structured OCR results (for non-partnership flow)
         try:
-            # Gather OCR results from output.json files for each image
             ocr_results = {}
             for filename in image_files_saved:
                 document_id = os.path.splitext(filename)[0]
@@ -376,7 +615,6 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                         "validation": {},
                         "is_valid": False
                     }
-            # --- LOGIC: Merge PDF ocr-response.json results ---
             ocr_response_path = os.path.join(save_dir, "ocr-response.json")
             if os.path.exists(ocr_response_path):
                 with open(ocr_response_path, "r", encoding="utf-8") as f:
@@ -391,7 +629,6 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                         "validation": pdf_ocr.get("validation", {}),
                         "is_valid": pdf_ocr.get("is_valid", False)
                     }
-            # --- Aggregate previous documents as before ---
             user_docs_dir = os.path.join("backend", "documents", "id", from_email)
             if os.path.exists(user_docs_dir):
                 for doc_dir in os.listdir(user_docs_dir):
@@ -409,10 +646,8 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                         }
             print(f"[INFO] OCR completed for {len(ocr_results)} documents")
 
-            # Check OCR results for required documents
             doc_status = check_documents_in_ocr(ocr_results)
             
-            # Identify wrongly submitted documents
             wrong_docs = [
                 (filename, data.get("type", "unknown"))
                 for filename, data in ocr_results.items()
@@ -439,7 +674,6 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                         required_docs.append("Resident Identity Card (EID)")
                     send_wrong_document_email(from_email, filename, summary, required_docs)
                     
-                    # Delete wrong document and its OCR results after sending mail
                     image_path = os.path.join("backend", "documents", "id", from_email, filename)
                     if os.path.exists(image_path):
                         os.remove(image_path)
@@ -451,7 +685,6 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                     print(f"[INFO] Deleted wrong document and OCR results: {filename}")
             
             if not doc_status["missing"] and not wrong_docs:
-                # Check for missing fields in validated documents
                 missing_fields_msgs = []
                 extracted_fields_msgs = []
                 for doc_name, doc_info in ocr_results.items():
@@ -481,7 +714,6 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                     print(f"[INFO] Sent missing fields notification to: {from_email}")
                     return
                 else:
-                    # Ask user to validate extracted fields
                     subject = "Please Validate Your Extracted Information"
                     body = (
                         "<html><body style='font-family:Arial,sans-serif;'>"
@@ -498,7 +730,6 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                     print(f"[INFO] Sent extracted fields for validation to: {from_email}")
                     return
 
-            # If missing documents
             if doc_status["missing"]:
                 subject = "Missing Document(s)"
                 missing_list = "".join([f"<li>{doc}</li>" for doc in doc_status["missing"]])
@@ -530,7 +761,6 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                         body += (
                             f"• {filename}: {status_message}\n"
                         )
-                    # Add LLM summaries
                     body += "\n".join(summary_texts)
                     body += "\nYou need to submit commercial and eid documents.\n"
                 body += "\nPlease reply to this email with the correct document(s) attached as image files."
@@ -538,22 +768,18 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
             send_email(to_email=from_email, subject=subject, body=body)
             print(f"[INFO] Document verification result sent to: {from_email}")
 
-            # If missing or wrong documents, don't proceed further
             if doc_status["missing"] or wrong_docs:
-                # Delete wrong documents and their OCR results
                 for filename, _ in wrong_docs:
-                    # Remove image file
                     image_path = os.path.join("backend", "documents", "id", from_email, filename)
                     if os.path.exists(image_path):
                         os.remove(image_path)
-                    # Remove OCR output directory
                     doc_id = os.path.splitext(filename)[0]
                     ocr_dir = os.path.join("backend", "documents", "id", from_email, doc_id)
                     print(f"[DEBUG] Checking to delete OCR dir: {ocr_dir},{image_path}")
                     if os.path.exists(ocr_dir):
                         import shutil
                         shutil.rmtree(ocr_dir)
-                    print(f"[INFO] Deleted wrong document and OCR results: {filename}")
+                    print(f"[INFO] Deleted wrong document and OCR results: {from_email}")
                 return
 
         except Exception as e:
@@ -580,8 +806,6 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
     convo_history = convo_response.data if convo_response.data else []
     convo_context = "\n".join([f"{msg['role']}: {msg['message']}" for msg in convo_history])
 
-    # Add onboarding_step to context
-    onboarding_step = user.get("onboarding_step", "welcome")
     full_context = f"Onboarding Step: {onboarding_step}\n\n{convo_context}\n\nFAQ:\n{faq_context}"
 
     # Step 4: Build prompt and call LLM with both contexts

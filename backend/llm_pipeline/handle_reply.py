@@ -5,7 +5,7 @@ from llm_runner.run_model import call_local_llm
 from app.services.supabase_client import supabase
 from app.services.email_sender import send_email, send_wrong_document_email
 from app.services.ocr_service import process_document
-from app.services.pdf_utils import pdf_to_images_pymupdf
+from app.services.pdf_utils import extract_text_from_pdf
 
 LLAMA_MODEL_NAME = "meta-llama/llama-3.2-11b-vision-instruct"
 QWEN_MODEL_NAME = "qwen/qwen-2.5-vl-7b-instruct"
@@ -147,7 +147,6 @@ def process_member_documents(user_email, member_name, attachments):
     
     # Save attachments to member's folder
     image_files_saved = []
-    pdf_image_names = []
     
     for a in attachments:
         filename = a["filename"]
@@ -163,24 +162,17 @@ def process_member_documents(user_email, member_name, attachments):
             pdf_path = os.path.join(member_dir, filename)
             with open(pdf_path, "wb") as f:
                 f.write(filedata)
-            pdf_images = pdf_to_images_pymupdf(pdf_path, member_dir)
-            pdf_image_names = [os.path.basename(img) for img in pdf_images]
-            image_files_saved.extend(pdf_image_names)
             
-            # OCR each PDF image
-            for img_name in pdf_image_names:
-                document_id = os.path.splitext(img_name)[0]
-                file_path = os.path.join(member_dir, img_name)
-                try:
-                    process_document(f"{user_email}/{member_name}", document_id, file_path, model_name=LLAMA_MODEL_NAME)
-                    time.sleep(60)
-                except Exception as e:
-                    print(f"[ERROR] OCR failed for {img_name}: {e}")
+            # Process PDF directly with text extraction
+            document_id = os.path.splitext(filename)[0]
+            try:
+                print(f"[INFO] Processing member PDF with text extraction: {filename}")
+                process_document(f"{user_email}/{member_name}", document_id, pdf_path, model_name=LLAMA_MODEL_NAME)
+            except Exception as e:
+                print(f"[ERROR] PDF processing failed for {filename}: {e}")
     
     # Process regular images with Qwen
     for filename in image_files_saved:
-        if filename in pdf_image_names:
-            continue
         document_id = os.path.splitext(filename)[0]
         file_path = os.path.join(member_dir, filename)
         try:
@@ -312,7 +304,7 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                             "<ul style='margin-left:20px;'>"
                             "<li>Resident Identity Card (EID)</li>"
                             "</ul>"
-                            "<p>Please reply to this email with the required document attached as image. </p>"
+                            "<p>Please reply to this email with the required document attached as image or PDF file.</p>"
                             "<p style='margin-top:32px;'>Best regards,<br><strong>Thrivv Onboarding Team</strong></p>"
                             "</div></body></html>"
                         )
@@ -328,7 +320,7 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                             "<div style='max-width:600px;margin:auto;padding:24px;background:#fff;border-radius:10px;box-shadow:0 2px 8px #eee;'>"
                             "<h2 style='color:#4CAF50;'>🎉 All Member Documents Verified!</h2>"
                             "<p>Dear User,</p>"
-                            "<p>Congratulations! We have successfully verified documents for all {len(members)} license members:</p>"
+                            f"<p>Congratulations! We have successfully verified documents for all {len(members)} license members:</p>"
                             "<ul>"
                             + "".join([f"<li><strong>{name}</strong></li>" for name in members])
                             + "</ul>"
@@ -402,7 +394,7 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
             subject = "Document Correction Required"
             body_text = (
                 "It appears there are corrections needed in your submitted information. "
-                "Please reply to this email with both your Commercial Registration Document and Resident Identity Card (EID) attached as image files."
+                "Please reply to this email with both your Commercial Registration Document and Resident Identity Card (EID) attached as image or PDF files."
             )
             send_email(to_email=from_email, subject=subject, body=body_text)
             print(f"[INFO] User {from_email} did not confirm extracted fields. Requested both documents again.")
@@ -415,7 +407,6 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
         os.makedirs(save_dir, exist_ok=True)
         
         image_files_saved = []
-        pdf_image_names = []
 
         for a in attachments:
             filename = a["filename"]
@@ -429,26 +420,23 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                 pdf_path = os.path.join(save_dir, filename)
                 with open(pdf_path, "wb") as f:
                     f.write(filedata)
-                pdf_images = pdf_to_images_pymupdf(pdf_path, save_dir)
-                pdf_image_names = [os.path.basename(img) for img in pdf_images]
-                image_files_saved.extend(pdf_image_names)
-                pdf_results = []
-                for img_name in pdf_image_names:
-                    document_id = os.path.splitext(img_name)[0]
-                    file_path = os.path.join(save_dir, img_name)
-                    try:
-                        result = process_document(f"{from_email}", document_id, file_path, model_name=LLAMA_MODEL_NAME)
-                        pdf_results.append(result)
-                    except Exception as e:
-                        print(f"[ERROR] OCR failed for {img_name}: {e}")
-                ocr_response_path = os.path.join(save_dir, "ocr-response.json")
-                with open(ocr_response_path, "w", encoding="utf-8") as f:
-                    json.dump(pdf_results, f, ensure_ascii=False, indent=2)
-                print(f"[INFO] Aggregated OCR response saved: {ocr_response_path}")
+                
+                # Process PDF directly with text extraction (no image conversion)
+                document_id = os.path.splitext(filename)[0]
+                try:
+                    print(f"[INFO] Processing PDF with text extraction: {filename}")
+                    result = process_document(f"{from_email}", document_id, pdf_path, model_name=LLAMA_MODEL_NAME)
+                    
+                    # Save single PDF result
+                    ocr_response_path = os.path.join(save_dir, "ocr-response.json")
+                    with open(ocr_response_path, "w", encoding="utf-8") as f:
+                        json.dump([result], f, ensure_ascii=False, indent=2)
+                    print(f"[INFO] PDF text extraction result saved: {ocr_response_path}")
+                    
+                except Exception as e:
+                    print(f"[ERROR] PDF processing failed for {filename}: {e}")
 
         for filename in image_files_saved:
-            if filename in pdf_image_names:
-                continue
             document_id = os.path.splitext(filename)[0]
             file_path = os.path.join(save_dir, filename)
             try:
@@ -475,7 +463,8 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                     
                     print(f"[DEBUG] Checking document: {filename}, type: {doc_type}")
                     
-                    if "page_1" in filename.lower() and doc_type == "commercial":
+                    # Check if this is page 1 and commercial type
+                    if doc_type == "commercial":
                         extracted_fields = doc.get("extracted_fields", {})
                         license_members = extracted_fields.get("License Members", [])
                         
@@ -483,29 +472,29 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                         
                         member_names = extract_license_members(license_members)
                         print(f"[DEBUG] Extracted member names: {member_names}")
-                        break
+                        if member_names:
+                            break
             
             if not member_names:
-                print("[DEBUG] No members found in PDF OCR, checking individual image OCR results")
+                print("[DEBUG] No members found in PDF, checking individual image OCR results")
                 for filename in image_files_saved:
-                    if "page_1" in filename.lower() or filename.lower().startswith("page1"):
-                        document_id = os.path.splitext(filename)[0]
-                        output_path = os.path.join(save_dir, document_id, "output.json")
-                        if os.path.exists(output_path):
-                            with open(output_path, "r", encoding="utf-8") as f:
-                                analysis = json.load(f)
-                            
-                            if analysis.get("document_type") == "commercial":
-                                extracted_fields = analysis.get("extracted_fields", {})
-                                license_members = extracted_fields.get("License Members", [])
-                                member_names = extract_license_members(license_members)
-                                print(f"[DEBUG] Found members in individual OCR {filename}: {member_names}")
-                                if member_names:
-                                    break
+                    document_id = os.path.splitext(filename)[0]
+                    output_path = os.path.join(save_dir, document_id, "output.json")
+                    if os.path.exists(output_path):
+                        with open(output_path, "r", encoding="utf-8") as f:
+                            analysis = json.load(f)
+                        
+                        if analysis.get("document_type") == "commercial":
+                            extracted_fields = analysis.get("extracted_fields", {})
+                            license_members = extracted_fields.get("License Members", [])
+                            member_names = extract_license_members(license_members)
+                            print(f"[DEBUG] Found members in individual OCR {filename}: {member_names}")
+                            if member_names:
+                                break
             
             if member_names:
                 if len(member_names) == 1:
-                    print(f"[WARN] Only one license member extracted: {member_names}. Re-running full OCR pipeline.")
+                    print(f"[WARN] Only one license member extracted: {member_names}. Re-running full processing.")
                     pdf_files = [f for f in os.listdir(save_dir) if f.lower().endswith(".pdf")]
                     if pdf_files:
                         original_pdf = pdf_files[0]
@@ -518,27 +507,27 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                                     import shutil
                                     shutil.rmtree(file_path)
                         print(f"[INFO] Cleaned up folder, kept only: {original_pdf}")
+                        
+                        # Re-process PDF
                         pdf_path = os.path.join(save_dir, original_pdf)
-                        pdf_images = pdf_to_images_pymupdf(pdf_path, save_dir)
-                        pdf_image_names = [os.path.basename(img) for img in pdf_images]
-                        pdf_results = []
-                        for img_name in pdf_image_names:
-                            document_id = os.path.splitext(img_name)[0]
-                            file_path = os.path.join(save_dir, img_name)
-                            try:
-                                result = process_document(f"{from_email}", document_id, file_path, model_name=LLAMA_MODEL_NAME)
-                                pdf_results.append(result)
-                            except Exception as e:
-                                print(f"[ERROR] OCR failed for {img_name}: {e}")
+                        document_id = os.path.splitext(original_pdf)[0]
+                        try:
+                            print(f"[INFO] Re-processing PDF with text extraction: {original_pdf}")
+                            result = process_document(f"{from_email}", document_id, pdf_path, model_name=LLAMA_MODEL_NAME)
+                            pdf_results = [result]
+                        except Exception as e:
+                            print(f"[ERROR] PDF re-processing failed: {e}")
+                            pdf_results = []
+                        
                         ocr_response_path = os.path.join(save_dir, "ocr-response.json")
                         with open(ocr_response_path, "w", encoding="utf-8") as f:
                             json.dump(pdf_results, f, ensure_ascii=False, indent=2)
-                        print(f"[INFO] Re-aggregated OCR response saved: {ocr_response_path}")
+                        print(f"[INFO] Re-aggregated extraction result saved: {ocr_response_path}")
+                        
                         member_names = []
                         for doc in pdf_results:
-                            filename = doc.get("filename", "")
                             doc_type = doc.get("document_type", "")
-                            if "page_1" in filename.lower() and doc_type == "commercial":
+                            if doc_type == "commercial":
                                 extracted_fields = doc.get("extracted_fields", {})
                                 license_members = extracted_fields.get("License Members", [])
                                 member_names = extract_license_members(license_members)
@@ -570,11 +559,11 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                     + "".join([f"<li><strong>{name}</strong></li>" for name in member_names])
                     + "</ul>"
                     f"<p>We will collect documents for each member one by one. Let's start with <strong>{first_member}</strong> (Member 1 of {len(member_names)}).</p>"
-                    "<p><strong>Required Documents for {first_member}:</strong></p>"
+                    f"<p><strong>Required Documents for {first_member}:</strong></p>"
                     "<ul style='margin-left:20px;'>"
                     "<li>Resident Identity Card (EID)</li>"
                     "</ul>"
-                    "<p>Please reply to this email with the required documents for <strong>{first_member}</strong> attached as image or PDF files.</p>"
+                    f"<p>Please reply to this email with the required documents for <strong>{first_member}</strong> attached as image or PDF files.</p>"
                     "<p style='margin-top:32px;'>Best regards,<br><strong>Thrivv Onboarding Team</strong></p>"
                     "</div></body></html>"
                 )
@@ -589,7 +578,7 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
             else:
                 print("[WARN] No license members found in commercial document for partnership/multiple owners")
 
-        # Now extract structured OCR results (for non-partnership flow)
+        # Now extract structured results (for non-partnership flow)
         try:
             ocr_results = {}
             for filename in image_files_saved:
@@ -615,6 +604,8 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                         "validation": {},
                         "is_valid": False
                     }
+            
+            # Load PDF results from ocr-response.json
             ocr_response_path = os.path.join(save_dir, "ocr-response.json")
             if os.path.exists(ocr_response_path):
                 with open(ocr_response_path, "r", encoding="utf-8") as f:
@@ -629,6 +620,8 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                         "validation": pdf_ocr.get("validation", {}),
                         "is_valid": pdf_ocr.get("is_valid", False)
                     }
+            
+            # Check existing documents in user's directory
             user_docs_dir = os.path.join("backend", "documents", "id", from_email)
             if os.path.exists(user_docs_dir):
                 for doc_dir in os.listdir(user_docs_dir):
@@ -644,7 +637,7 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                             "validation": analysis.get("validation", {}),
                             "is_valid": analysis.get("is_valid", False)
                         }
-            print(f"[INFO] OCR completed for {len(ocr_results)} documents")
+            print(f"[INFO] Text extraction completed for {len(ocr_results)} documents")
 
             doc_status = check_documents_in_ocr(ocr_results)
             
@@ -682,7 +675,7 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                     if os.path.exists(ocr_dir):
                         import shutil
                         shutil.rmtree(ocr_dir)
-                    print(f"[INFO] Deleted wrong document and OCR results: {filename}")
+                    print(f"[INFO] Deleted wrong document and results: {filename}")
             
             if not doc_status["missing"] and not wrong_docs:
                 missing_fields_msgs = []
@@ -740,7 +733,7 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                     "<p>Dear User,</p>"
                     "<p>We have received your submission. However, the following document(s) are still required:</p>"
                     f"<ul>{missing_list}</ul>"
-                    "<p>Please reply to this email with the missing document(s) attached as image files.</p>"
+                    "<p>Please reply to this email with the missing document(s) attached as image or PDF files.</p>"
                     "<p style='margin-top:32px;'>Best regards,<br><strong>Thrivv Onboarding Team</strong></p>"
                     "</div></body></html>"
                 )
@@ -763,7 +756,7 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                         )
                     body += "\n".join(summary_texts)
                     body += "\nYou need to submit commercial and eid documents.\n"
-                body += "\nPlease reply to this email with the correct document(s) attached as image files."
+                body += "\nPlease reply to this email with the correct document(s) attached as image or PDF files."
 
             send_email(to_email=from_email, subject=subject, body=body)
             print(f"[INFO] Document verification result sent to: {from_email}")
@@ -775,17 +768,17 @@ def process_user_reply(from_email: str, body: str, attachments: list = None):
                         os.remove(image_path)
                     doc_id = os.path.splitext(filename)[0]
                     ocr_dir = os.path.join("backend", "documents", "id", from_email, doc_id)
-                    print(f"[DEBUG] Checking to delete OCR dir: {ocr_dir},{image_path}")
+                    print(f"[DEBUG] Checking to delete dir: {ocr_dir},{image_path}")
                     if os.path.exists(ocr_dir):
                         import shutil
                         shutil.rmtree(ocr_dir)
-                    print(f"[INFO] Deleted wrong document and OCR results: {from_email}")
+                    print(f"[INFO] Deleted wrong document and results: {from_email}")
                 return
 
         except Exception as e:
-            print(f"[ERROR] OCR failed for {from_email}: {e}")
+            print(f"[ERROR] Document processing failed for {from_email}: {e}")
             subject = "Error Processing Your Documents"
-            body = f"We encountered an error while processing your documents. Please ensure your images are clear and readable, then try submitting them again.\n\nError details: {str(e)}"
+            body = f"We encountered an error while processing your documents. Please ensure your images/PDFs are clear and readable, then try submitting them again.\n\nError details: {str(e)}"
             send_email(to_email=from_email, subject=subject, body=body)
             return
 

@@ -8,6 +8,7 @@ import re
 from dotenv import load_dotenv
 from app.services.supabase_client import supabase
 from llm_runner.run_model import call_local_llm
+from app.services.pdf_utils import extract_text_from_pdf
 
 
 load_dotenv()
@@ -79,6 +80,7 @@ def encode_image(image_path: str) -> str:
     return f"data:image/{mime_type};base64,{image_b64}"
 
 def run_ocr(image_path: str, model_name: str = LLAMA_MODEL_NAME) -> str:
+    """Run OCR on image files using vision model"""
     image_url = encode_image(image_path)
 
     prompt = """You are an OCR system. Perform OCR on the provided image and extract all text accurately.
@@ -161,22 +163,38 @@ def validate_fields(extracted: dict, doc_type: str) -> dict:
 def process_document(user_email: str, document_id: str, file_path: str, model_name: str = LLAMA_MODEL_NAME) -> dict:
     """
     Full pipeline:
-    1. Perform OCR
-    2. Identify doc type
-    3. Extract fields using LLM with schema prompt
-    4. Validate
-    5. Save JSON into backend/documents/id/<user>/<doc_id>/output.json
+    1. Check if PDF or image
+    2. If PDF: Extract text using PDF reader
+       If Image: Perform OCR using vision model
+    3. Identify doc type
+    4. Extract fields using LLM with schema prompt
+    5. Validate
+    6. Save JSON into backend/documents/id/<user>/<doc_id>/output.json
     """
     print(f"[INFO] Processing {file_path} for {user_email} with model {model_name}")
 
     try:
-        raw_text = run_ocr(file_path, model_name)
+        # Check if file is PDF
+        if file_path.lower().endswith('.pdf'):
+            print(f"[INFO] Detected PDF file, using PDF reader instead of OCR")
+            pdf_data = extract_text_from_pdf(file_path)
+            
+            if pdf_data.get('error'):
+                raise RuntimeError(f"PDF text extraction failed: {pdf_data['error']}")
+            
+            raw_text = pdf_data['full_text']
+            print(f"[INFO] Extracted {len(raw_text)} characters from PDF")
+        else:
+            # Use OCR for image files
+            print(f"[INFO] Detected image file, using OCR with model {model_name}")
+            raw_text = run_ocr(file_path, model_name)
+            
     except Exception as e:
         raw_text = ""
         analysis = {
             "filename": os.path.basename(file_path),
             "document_type": "error",
-            "raw_text": f"[OCR ERROR] {str(e)}",
+            "raw_text": f"[EXTRACTION ERROR] {str(e)}",
             "extracted_fields": {},
             "validation": {"is_valid": False, "required_fields": [], "present_fields": [], "missing_fields": []},
             "status_message": f"❌ ERROR: Failed to process {os.path.basename(file_path)}",
@@ -221,7 +239,8 @@ def process_document(user_email: str, document_id: str, file_path: str, model_na
             "extracted_fields": llm_extracted,
             "validation": validation,
             "status_message": status,
-            "is_valid": doc_type in ["commercial", "eid"] and validation["is_valid"]
+            "is_valid": doc_type in ["commercial", "eid"] and validation["is_valid"],
+            "extraction_method": "pdf_reader" if file_path.lower().endswith('.pdf') else "ocr"
         }
 
     # Save JSON
